@@ -1,0 +1,14 @@
+# Local-only secrets, caches and runtime data
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+*.db
+*.db-*
+*.sqlite*
+.DS_Store
