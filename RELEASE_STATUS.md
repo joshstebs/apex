@@ -15,7 +15,7 @@
 ## Critical unresolved prerequisites, do not switch the live number yet
 1. **Five-minute carrier-side hard termination:** the webhook's elapsed-time check only acts at the next speech turn. A carrier-side timer or authenticated call-update termination must be implemented and tested with SignalWire. The administrative terminate endpoint is intentionally disabled on Vercel rather than falsely claiming carrier termination.
 2. **Provider integration:** validate webhook signature using real SignalWire callbacks, confirm signed callback URL/proxy normalization, actual Hugging Face model availability, and ElevenLabs MP3 response format, latency and quotas.
-3. **Spending:** Redis reserves a nominal $1 per admitted call and reconciles an estimated cost. This is not a provider billing cap. ElevenLabs credits, carrier billing, inbound STT and provider costs are not reconciled against real usage. Explicit provider spending alerts/caps and a reconciliation job are needed.
+3. **Spending:** Redis reserves an estimated $3 per admitted call by default (`APEX_MAX_CALL_RESERVE_USD`, configurable) and reconciles an estimated cost. This is not a provider billing cap. ElevenLabs credits, carrier billing, inbound STT and provider costs are not reconciled against real usage. Explicit provider spending alerts/caps and a reconciliation job are needed.
 4. **Redis lifecycle:** 315-second active-call lock can expire while a call remains active; refresh/heartbeat or carrier-enforced termination is required before routing live traffic. Upstash REST EVAL support and atomic scripts need a real integration test.
 5. **Audio delivery:** single-use clip redemption blocks repeated charges but a provider retry may fail; production needs shared, encrypted/controlled cached audio bytes with a short TTL and idempotent GET behavior.
 6. **Production administration:** editing and call listing are deliberately disabled rather than relying on ephemeral storage. Implement durable indexes and authenticated mutation if those features are required.
@@ -46,3 +46,4 @@ This release is a **security and durability improvement, not production-ready li
 - Sample config includes `APEX_ADMIN_TOKEN`; added `.gitignore` for secrets/runtime state; README now accurately labels prototype and unverified features.
 - Renamed obsolete failing test suite to `legacy_vercel_corrections_reference.py` rather than presenting it as a valid regression test.
 - Added `test_safe_fallbacks.py`. Actual provider-integrated behavior remains untested.
+- Vercel deployments now force webhook signature enforcement regardless of an accidentally insecure `ENFORCE_WEBHOOK_SIGNATURE` environment override; health readouts no longer treat Turso-only storage as production-call-ready.

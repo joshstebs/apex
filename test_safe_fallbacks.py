@@ -32,3 +32,8 @@ with patch.object(settings, "UPSTASH_REDIS_REST_URL", "https://mock.invalid"), \
         except RuntimeError:
             pass
 print("PASS: no fabricated fallback results, local SQLite sync, Redis state NX failure")
+
+with patch.dict(os.environ, {"VERCEL": "1", "ENFORCE_WEBHOOK_SIGNATURE": "false"}):
+    from config import AppSettings
+    assert AppSettings().ENFORCE_WEBHOOK_SIGNATURE is True
+print("PASS: production webhook signature enforcement cannot be disabled")

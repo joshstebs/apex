@@ -21,7 +21,8 @@ class AppSettings:
         self.SIGNALWIRE_SIGNING_KEY: str = os.getenv("SIGNALWIRE_SIGNING_KEY", "")
         self.SIGNALWIRE_PHONE_NUMBER: str = os.getenv("SIGNALWIRE_PHONE_NUMBER", "+12267730802")
         # Enforce webhook signature verification (enabled by default in production)
-        self.ENFORCE_WEBHOOK_SIGNATURE: bool = os.getenv("ENFORCE_WEBHOOK_SIGNATURE", "true").lower() == "true"
+        # Production cannot disable provider-authenticated webhooks by mistake.
+        self.ENFORCE_WEBHOOK_SIGNATURE: bool = bool(os.getenv("VERCEL")) or os.getenv("ENFORCE_WEBHOOK_SIGNATURE", "true").lower() == "true"
         
         # ElevenLabs Configuration
         self.ELEVENLABS_API_KEY: str = os.getenv("ELEVENLABS_API_KEY", "")

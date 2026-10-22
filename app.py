@@ -244,7 +244,10 @@ def get_sanitized_health_and_settings() -> Dict[str, Any]:
         "huggingface_router_endpoint": settings.HUGGINGFACE_ROUTER_URL,
         "huggingface_llm_model": settings.HUGGINGFACE_LLM_MODEL,
         "durable_storage_backend": settings.durable_storage_backend(),
-        "durable_storage_configured": settings.durable_storage_backend() in ("upstash_redis", "turso_libsql"),
+        "durable_storage_configured": (
+            settings.durable_storage_backend() == "upstash_redis" if os.getenv("VERCEL")
+            else settings.durable_storage_backend() in ("upstash_redis", "turso_libsql")
+        ),
         "max_concurrent_calls": settings.MAX_CONCURRENT_CALLS,
         "active_calls_count": None,
         "max_call_duration_seconds": settings.MAX_CALL_DURATION_SECONDS,

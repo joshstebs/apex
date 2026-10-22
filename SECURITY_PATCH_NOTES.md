@@ -2,7 +2,7 @@
 
 - Removed permissive cross-origin middleware.
 - Protected assistant, call-history, simulator, voice-list, and mutation endpoints with `Authorization: Bearer <APEX_ADMIN_TOKEN>`. Set a long random `APEX_ADMIN_TOKEN` in Vercel. Existing browser UI must be updated to authenticate before administrative functions can be used.
-- Redis call admission now uses one Lua EVAL operation for the concurrency lock and a conservative $1/call budget reservation. An owning call's release reconciles that reservation with estimated call cost. These are application estimates, **not** a carrier-side billing cap.
+- Redis call admission now uses one Lua EVAL operation for the concurrency lock and a configurable call budget reservation (currently $3/call by default). An owning call's release reconciles that reservation with estimated call cost. These are application estimates, **not** a carrier-side billing cap.
 - Production (`VERCEL=1`) refuses new calls unless Upstash Redis is configured; Redis failures fail closed instead of allowing local SQLite admission. Production audio lookup does not silently fall back to local SQLite.
 - Existing tests mock Upstash commands but not Lua EVAL, so the original offline suite needs updated mocks before it can pass. No live provider tests performed.
 
