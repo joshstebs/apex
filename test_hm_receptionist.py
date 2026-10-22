@@ -19,7 +19,7 @@ template = db.get_assistant("tpl_hm_receptionist")
 assert template and "Harbour & Main" in template["name"]
 assert "transcrib" in template["first_message"].lower()
 def send_voice(to):
-    p = {"CallSid":"CA_local_test_01","From":"+15195550101","To":to}
+    p = {"CallSid":"12345678-1234-1234-1234-123456789012","From":"+15195550101","To":to}
     url = "http://testserver/webhooks/signalwire/voice"
     sig = telephony.compute_signalwire_laml_signature(settings.SIGNALWIRE_SIGNING_KEY,url,p)
     return client.post("/webhooks/signalwire/voice",content=urllib.parse.urlencode(p),headers={"X-SignalWire-Signature":sig,"Content-Type":"application/x-www-form-urlencoded"})
@@ -44,11 +44,11 @@ class Response:
 def fake_urlopen(req,timeout=0):
     assert req.get_method()=="POST"
     assert req.data==b"Status=completed"
-    assert req.full_url.endswith("/Calls/CA_local_test_01")
+    assert req.full_url.endswith("/Calls/12345678-1234-1234-1234-123456789012")
     assert req.get_header("Authorization").startswith("Basic ")
     return Response()
 with patch("urllib.request.urlopen",fake_urlopen):
-    assert telephony.terminate_signalwire_call("CA_local_test_01")
+    assert telephony.terminate_signalwire_call("12345678-1234-1234-1234-123456789012")
 try:
     telephony.terminate_signalwire_call("CA_bad/../../")
     assert False,"unsafe SID allowed"
