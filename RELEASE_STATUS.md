@@ -47,3 +47,12 @@ This release is a **security and durability improvement, not production-ready li
 - Renamed obsolete failing test suite to `legacy_vercel_corrections_reference.py` rather than presenting it as a valid regression test.
 - Added `test_safe_fallbacks.py`. Actual provider-integrated behavior remains untested.
 - Vercel deployments now force webhook signature enforcement regardless of an accidentally insecure `ENFORCE_WEBHOOK_SIGNATURE` environment override; health readouts no longer treat Turso-only storage as production-call-ready.
+
+
+## 2026-10-22 Harbour & Main receptionist staged implementation
+- Added a dedicated inbound Harbour & Main AI receptionist persona with explicit AI/transcription notice and safe information boundaries.
+- Default inbound assistant uses `INBOUND_ASSISTANT_ID`; public webhook query overrides are disabled by default and calls to other numbers are rejected.
+- Added an independent `RECEPTIONIST_ENABLED` safety switch, off by default.
+- Added SignalWire REST call-completion support, protected administrative terminate API, and an external scheduler watchdog endpoint that only *requests* call termination.
+- **Not an exact hard 20-minute limit.** Minute scheduling requires separate external setup, which is not bundled or enabled. Failed scheduler/carrier requests can result in calls running longer.
+- Still requires separate provider credentials, durable Redis, real test DID ownership confirmation, carrier webhook configuration, live integration tests, and actual billing reconciliation. No number was purchased or routed.

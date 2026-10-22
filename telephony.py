@@ -7,6 +7,9 @@ import hmac
 import hashlib
 import base64
 import urllib.parse
+import urllib.request
+import urllib.error
+import re
 import xml.sax.saxutils as saxutils
 from typing import Dict, Any, Optional
 from config import settings
@@ -25,6 +28,37 @@ class TelephonyGateway:
         self.signalwire_token = signalwire_token or settings.SIGNALWIRE_API_TOKEN
         self.signalwire_from = signalwire_from_number or settings.SIGNALWIRE_PHONE_NUMBER
         self.public_url = public_url or settings.PUBLIC_URL
+
+
+    def terminate_signalwire_call(self, call_sid: str) -> bool:
+        """Ask SignalWire to complete an active call. A successful HTTP response
+        means a request was accepted, not that billing has been reconciled.
+        """
+        if not (self.signalwire_project_id and self.signalwire_token and self.signalwire_space):
+            raise RuntimeError("SignalWire credentials are not configured")
+        if not re.fullmatch(r"[a-zA-Z0-9-]{10,80}", call_sid or ""):
+            raise ValueError("Invalid call SID")
+        space = self.signalwire_space.strip().lower()
+        if not re.fullmatch(r"[a-z0-9-]+\.signalwire\.com", space):
+            raise ValueError("SignalWire Space must be a signalwire.com hostname")
+        project = urllib.parse.quote(self.signalwire_project_id, safe="")
+        sid = urllib.parse.quote(call_sid, safe="")
+        url = f"https://{space}/api/laml/2010-04-01/Accounts/{project}/Calls/{sid}"
+        basic = base64.b64encode(f"{self.signalwire_project_id}:{self.signalwire_token}".encode()).decode()
+        req = urllib.request.Request(
+            url,
+            data=urllib.parse.urlencode({"Status": "completed"}).encode(),
+            method="POST",
+            headers={
+                "Authorization": f"Basic {basic}",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as response:
+                return response.status == 200
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise RuntimeError("SignalWire call termination failed") from exc
 
     @staticmethod
     def compute_signalwire_laml_signature(signing_key: str, url: str, params: Dict[str, str]) -> str:

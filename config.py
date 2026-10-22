@@ -20,6 +20,14 @@ class AppSettings:
         self.SIGNALWIRE_API_TOKEN: str = os.getenv("SIGNALWIRE_API_TOKEN", "")
         self.SIGNALWIRE_SIGNING_KEY: str = os.getenv("SIGNALWIRE_SIGNING_KEY", "")
         self.SIGNALWIRE_PHONE_NUMBER: str = os.getenv("SIGNALWIRE_PHONE_NUMBER", "+12267730802")
+        self.INBOUND_ASSISTANT_ID: str = os.getenv("INBOUND_ASSISTANT_ID", "tpl_hm_receptionist")
+        # Disable unauthorized selection of a different assistant from a public webhook URL.
+        self.ALLOW_INBOUND_ASSISTANT_OVERRIDE: bool = os.getenv("ALLOW_INBOUND_ASSISTANT_OVERRIDE", "false").lower() == "true"
+        self.REQUIRE_MATCHING_INBOUND_NUMBER: bool = os.getenv("REQUIRE_MATCHING_INBOUND_NUMBER", "true").lower() == "true"
+        self.RECEPTIONIST_BUSINESS_NAME: str = os.getenv("RECEPTIONIST_BUSINESS_NAME", "Harbour & Main")
+        # External scheduler must be configured separately. Never assume a scheduler exists.
+        self.CRON_SECRET: str = os.getenv("CRON_SECRET", "")
+        self.RECEPTIONIST_ENABLED: bool = os.getenv("RECEPTIONIST_ENABLED", "false").lower() == "true"
         # Enforce webhook signature verification (enabled by default in production)
         # Production cannot disable provider-authenticated webhooks by mistake.
         self.ENFORCE_WEBHOOK_SIGNATURE: bool = bool(os.getenv("VERCEL")) or os.getenv("ENFORCE_WEBHOOK_SIGNATURE", "true").lower() == "true"

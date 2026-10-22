@@ -62,25 +62,30 @@ def handle_signalwire_inbound_or_connect(
     and returns SignalWire cXML.
     """
     call_id = params.get("CallSid") or f"call_{uuid.uuid4().hex[:12]}"
-    assistant_id = query_params.get("assistant_id")
     from_number = params.get("From", "Unknown")
-
-    ast = db.get_assistant(assistant_id) if assistant_id else None
+    # Only accept incoming calls for the number configured by the operator.
+    # This prevents another DID in the same account from being unintentionally answered.
+    dialed = params.get("To", "")
+    if settings.REQUIRE_MATCHING_INBOUND_NUMBER and dialed != settings.SIGNALWIRE_PHONE_NUMBER:
+        return telephony.build_signalwire_cxml_hangup(
+            "This line is not configured for the automated receptionist. Goodbye."
+        )
+    if not settings.RECEPTIONIST_ENABLED:
+        return telephony.build_signalwire_cxml_hangup(
+            "The automated receptionist is not yet available. Please contact the business directly."
+        )
+    assistant_id = settings.INBOUND_ASSISTANT_ID
+    if settings.ALLOW_INBOUND_ASSISTANT_OVERRIDE and query_params.get("assistant_id"):
+        assistant_id = query_params["assistant_id"]
+    ast = db.get_assistant(assistant_id)
     if not ast:
-        assistants = db.list_assistants()
-        ast = assistants[0] if assistants else {
-            "id": "default_inbound",
-            "name": "Inbound Receptionist",
-            "first_message": "Hello! You have reached Josh Stebs' AI assistant. How can I help you today?",
-            "system_prompt": "You are a polite, concise voice assistant answering calls for Josh Stebs.",
-            "voice_id": settings.ELEVENLABS_DEFAULT_VOICE_ID,
-            "temperature": 0.4,
-            "tools": []
-        }
+        # Do not silently select an unrelated outbound assistant.
+        return telephony.build_signalwire_cxml_hangup(
+            "The receptionist is temporarily unavailable. Please contact the business directly."
+        )
 
-    greeting = (
-        "Hello! You've reached Josh Stebs' automated assistant. "
-        "How can I help you today?"
+    greeting = VoiceEngine.render_prompt(
+        ast["first_message"], {"business_name": settings.RECEPTIONIST_BUSINESS_NAME}
     )
 
     call_record = {
@@ -254,7 +259,14 @@ def get_sanitized_health_and_settings() -> Dict[str, Any]:
         "monthly_budget_limit_usd": settings.MONTHLY_BUDGET_LIMIT_USD,
         "current_monthly_spend_usd": None,
         "tts_clip_ttl_seconds": settings.TTS_CLIP_TTL_SECONDS,
-        "outbound_calling_enabled": False
+        "outbound_calling_enabled": False,
+        "receptionist_enabled": settings.RECEPTIONIST_ENABLED,
+        "inbound_number_restricted": settings.REQUIRE_MATCHING_INBOUND_NUMBER,
+        "configured_receptionist": settings.INBOUND_ASSISTANT_ID,
+        "carrier_termination_configured": bool(
+            settings.SIGNALWIRE_PROJECT_ID and settings.SIGNALWIRE_API_TOKEN
+        ),
+        "external_deadline_scheduler_configured": bool(settings.CRON_SECRET)
     }
 
 # =========================================================================
@@ -415,7 +427,23 @@ try:
     @app.post("/api/calls/{call_id}/terminate")
     def terminate_call(call_id: str, admin=Depends(require_admin)):
         if os.getenv("VERCEL"):
-            raise HTTPException(status_code=503, detail="Carrier-side termination not implemented; cannot claim a hard cutoff")
+            c = db.get_call(call_id)
+            if not c:
+                raise HTTPException(status_code=404, detail="Call not found")
+            if c.get("provider") != "signalwire" or c.get("direction") != "inbound":
+                raise HTTPException(status_code=400, detail="Only inbound SignalWire calls can be terminated")
+            if c.get("status") != "in-progress":
+                raise HTTPException(status_code=409, detail="Call is no longer active")
+            if db._upstash_cmd(["GET", "apex:active_call_lock"]) != call_id:
+                raise HTTPException(status_code=409, detail="Call no longer owns the active slot")
+            try:
+                requested = telephony.terminate_signalwire_call(call_id)
+            except (RuntimeError, ValueError) as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
+            if not requested:
+                raise HTTPException(status_code=502, detail="Carrier did not accept termination")
+            # Carrier callback owns final state and actual duration; do not fake completion.
+            return {"success": True, "call_id": call_id, "termination_requested": True}
         c = db.get_call(call_id)
         if not c:
             raise HTTPException(status_code=404, detail="Call not found")
@@ -591,6 +619,38 @@ try:
             })
             db.release_call_slot(call_id, cost_delta=cost_info["cost_total"])
         return {"status": "ok"}
+
+    @app.post("/api/maintenance/enforce-call-duration")
+    def enforce_call_duration(request: Request):
+        # Requires an external, trusted minute-level scheduler. Not enabled by default.
+        secret = settings.CRON_SECRET
+        authorization = request.headers.get("authorization", "")
+        if not secret or not hmac.compare_digest(authorization, f"Bearer {secret}"):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        if not os.getenv("VERCEL") or settings.durable_storage_backend() != "upstash_redis":
+            raise HTTPException(status_code=503, detail="Durable carrier enforcement unavailable")
+        try:
+            call_id = db._upstash_cmd(["GET", "apex:active_call_lock"])
+            if not call_id:
+                return {"checked": True, "active": False, "termination_requested": False}
+            call = db.get_call(call_id)
+            if not call or call.get("status") != "in-progress":
+                raise HTTPException(status_code=503, detail="Active call state unavailable")
+            from datetime import timezone
+            started = datetime.fromisoformat(call["started_at"].replace("Z", "+00:00"))
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+            seconds = max(0, (datetime.now(timezone.utc) - started).total_seconds())
+            if seconds < settings.MAX_CALL_DURATION_SECONDS:
+                return {"checked": True, "active": True, "termination_requested": False}
+            accepted = telephony.terminate_signalwire_call(call_id)
+            if not accepted:
+                raise HTTPException(status_code=502, detail="Carrier rejected termination")
+            return {"checked": True, "active": True, "termination_requested": True}
+        except HTTPException:
+            raise
+        except (RuntimeError, ValueError, TypeError, KeyError) as exc:
+            raise HTTPException(status_code=502, detail="Unable to enforce call duration") from exc
 
     @app.get("/api/voices")
     def get_voices(admin=Depends(require_admin)):
