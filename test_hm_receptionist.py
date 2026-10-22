@@ -20,7 +20,7 @@ assert template and "Harbour & Main" in template["name"]
 assert "transcrib" in template["first_message"].lower()
 def send_voice(to):
     p = {"CallSid":"CA_local_test_01","From":"+15195550101","To":to}
-    url = "https://testserver/webhooks/signalwire/voice"
+    url = "http://testserver/webhooks/signalwire/voice"
     sig = telephony.compute_signalwire_laml_signature(settings.SIGNALWIRE_SIGNING_KEY,url,p)
     return client.post("/webhooks/signalwire/voice",content=urllib.parse.urlencode(p),headers={"X-SignalWire-Signature":sig,"Content-Type":"application/x-www-form-urlencoded"})
 r=send_voice("+12267730802")
@@ -30,7 +30,8 @@ r=send_voice("+15195550000")
 assert r.status_code==200 and "not configured" in r.text.lower(),r.text
 settings.RECEPTIONIST_ENABLED=False
 assert client.post("/api/maintenance/enforce-call-duration").status_code==401
-assert client.post("/api/calls/anything/terminate",headers=headers).status_code==404
+with patch.object(db,"get_call",return_value=None):
+    assert client.post("/api/calls/anything/terminate",headers=headers).status_code==404
 # Verify exact provider request shape without sending a real request.
 settings.SIGNALWIRE_PROJECT_ID = "12345678-1234-1234-1234-123456789012"
 settings.SIGNALWIRE_API_TOKEN = "unit-test-carrier-token"

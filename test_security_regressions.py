@@ -8,6 +8,7 @@ settings.UPSTASH_REDIS_REST_URL='https://mock.invalid'
 settings.UPSTASH_REDIS_REST_TOKEN='test-only'
 settings.SIGNALWIRE_SIGNING_KEY='test-signature-key'
 settings.ENFORCE_WEBHOOK_SIGNATURE=True
+settings.RECEPTIONIST_ENABLED=True
 redis={}
 def cmd(c):
     op=c[0].upper()
