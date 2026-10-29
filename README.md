@@ -71,3 +71,41 @@ status callback must be checked and invoices reconciled. An external 60-second
 watchdog is **not** an exact 20-minute cutoff; with a failed callback or scheduler,
 the call can exceed 20 minutes. Vercel Hobby cron cannot run every minute.
 Do not activate live routing until carrier-enforced duration and usage tests pass.
+
+
+## Purchased SignalWire test number (October 29, 2026)
+
+- Number: **+1 (226) 773-2234**, E.164 **+12267732234**
+- SignalWire number ID: `8f935d8b-bd61-457b-b421-edddfef247ea`
+- Receptionist persona: `tpl_hm_receptionist`; ElevenLabs Rachel (`21m00Tcm4TlvDq8ikWAM`),
+  model `eleven_turbo_v2_5` for synthesized speech.
+- AI conversational reasoning still uses Hugging Face. **An ElevenLabs API key alone is not enough** for interactive conversation.
+- `PUBLIC_URL=https://apex-stebs-co.vercel.app` for a production deployment which accepts provider POST webhooks.
+  Deployment Protection must allow only the public signed webhook requests on that hostname;
+  all admin data APIs still require `APEX_ADMIN_TOKEN`.
+
+### Activation checklist (do not skip)
+
+1. Verify the number belongs to your SignalWire Space and supports **Voice**.
+   The number ID is an inventory ID, **not an API token or Project ID**.
+2. Set `SIGNALWIRE_PROJECT_ID`, `SIGNALWIRE_API_TOKEN`,
+   `SIGNALWIRE_SIGNING_KEY` (if used), `ELEVENLABS_API_KEY`,
+   `HUGGINGFACE_API_KEY`, `UPSTASH_REDIS_REST_URL`,
+   `UPSTASH_REDIS_REST_TOKEN`, and a strong `APEX_ADMIN_TOKEN`
+   as **encrypted Vercel environment variables**. Never commit actual keys.
+3. Verify `GET /api/health` reports `receptionist_provider_ready: true`;
+   test ElevenLabs synthesized audio and Hugging Face inference with real credits.
+4. Set `RECEPTIONIST_ENABLED=true` only for a controlled short live test.
+5. In SignalWire Phone Numbers -> +1 226-773-2234 -> Edit Settings ->
+   Inbound Call Settings, configure a **Compatibility API / cXML** incoming
+   voice webhook (POST) at:
+   `https://apex-stebs-co.vercel.app/webhooks/signalwire/voice`
+   and a call status callback (POST) at
+   `https://apex-stebs-co.vercel.app/webhooks/signalwire/status`.
+   Depending on your SignalWire dashboard, configure a cXML resource using the
+   external URL and assign that resource to the number. Do not configure a
+   SWML-only handler expecting a SWML response: this application returns cXML.
+6. Test greeting, several turns, no-answer path, voicemail details, duration,
+   explicit hangup, provider callback signatures, and actual billable usage.
+   No human transfer, outbound calls, staff alerts or actual appointment
+   booking is implemented. A 20-minute **exact carrier limit is not verified**.

@@ -56,3 +56,12 @@ This release is a **security and durability improvement, not production-ready li
 - Added SignalWire REST call-completion support, protected administrative terminate API, and an external scheduler watchdog endpoint that only *requests* call termination.
 - **Not an exact hard 20-minute limit.** Minute scheduling requires separate external setup, which is not bundled or enabled. Failed scheduler/carrier requests can result in calls running longer.
 - Still requires separate provider credentials, durable Redis, real test DID ownership confirmation, carrier webhook configuration, live integration tests, and actual billing reconciliation. No number was purchased or routed.
+
+
+## 2026-10-29 purchased-number onboarding
+- Confirmed user-provided newly purchased test number `+12267732234` and number inventory ID `8f935d8b-bd61-457b-b421-edddfef247ea`.
+- Default DID and documentation updated; assistant retains ElevenLabs Rachel/Turbo v2.5 for speech output.
+- Added `receptionist_provider_ready` non-secret health flag and fail-closed production provider readiness check.
+- Added regression fixture for exact DID, ElevenLabs speech request and cXML webhook URLs.
+- Not a completed real-number hookup: SignalWire and ElevenLabs credentials, Hugging Face model credentials and Upstash Redis environment variables, and carrier-side Voice URL routing still need to be configured and verified.
+- `RECEPTIONIST_ENABLED=false` until live provider validation. No phone route changed.

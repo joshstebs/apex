@@ -7,7 +7,7 @@ from app import app, db, settings, telephony
 from unittest.mock import patch
 settings.RECEPTIONIST_ENABLED = False
 settings.REQUIRE_MATCHING_INBOUND_NUMBER = True
-settings.SIGNALWIRE_PHONE_NUMBER = "+12267730802"
+settings.SIGNALWIRE_PHONE_NUMBER = "+12267732234"
 settings.SIGNALWIRE_SIGNING_KEY = "unit-test-signing-key"
 settings.ENFORCE_WEBHOOK_SIGNATURE = True
 settings.UPSTASH_REDIS_REST_URL = "https://mock.invalid"
@@ -17,13 +17,15 @@ client = TestClient(app)
 headers = {"Authorization": "Bearer test-admin"}
 template = db.get_assistant("tpl_hm_receptionist")
 assert template and "Harbour & Main" in template["name"]
+assert settings.SIGNALWIRE_PHONE_NUMBER == "+12267732234"
+assert settings.SIGNALWIRE_PHONE_NUMBER_ID == "8f935d8b-bd61-457b-b421-edddfef247ea"
 assert "transcrib" in template["first_message"].lower()
 def send_voice(to):
     p = {"CallSid":"12345678-1234-1234-1234-123456789012","From":"+15195550101","To":to}
     url = "http://testserver/webhooks/signalwire/voice"
     sig = telephony.compute_signalwire_laml_signature(settings.SIGNALWIRE_SIGNING_KEY,url,p)
     return client.post("/webhooks/signalwire/voice",content=urllib.parse.urlencode(p),headers={"X-SignalWire-Signature":sig,"Content-Type":"application/x-www-form-urlencoded"})
-r=send_voice("+12267730802")
+r=send_voice("+12267732234")
 assert r.status_code==200 and "not yet available" in r.text.lower(),r.text
 settings.RECEPTIONIST_ENABLED=True
 r=send_voice("+15195550000")

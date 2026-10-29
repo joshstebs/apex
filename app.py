@@ -74,6 +74,16 @@ def handle_signalwire_inbound_or_connect(
         return telephony.build_signalwire_cxml_hangup(
             "The automated receptionist is not yet available. Please contact the business directly."
         )
+    # Production calls must never proceed in an unconfigured text-only/silent demo.
+    if os.getenv("VERCEL") and not (
+        settings.get_webhook_signing_key()
+        and settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN
+        and settings.ELEVENLABS_API_KEY and settings.HUGGINGFACE_API_KEY
+        and settings.PUBLIC_URL.startswith("https://")
+    ):
+        return telephony.build_signalwire_cxml_hangup(
+            "The receptionist is temporarily unavailable. Please contact Harbour and Main directly."
+        )
     assistant_id = settings.INBOUND_ASSISTANT_ID
     if settings.ALLOW_INBOUND_ASSISTANT_OVERRIDE and query_params.get("assistant_id"):
         assistant_id = query_params["assistant_id"]
@@ -240,6 +250,16 @@ def get_sanitized_health_and_settings() -> Dict[str, Any]:
         "status": "ok",
         "default_provider": settings.DEFAULT_TELEPHONY_PROVIDER,
         "signalwire_space_configured": bool(settings.SIGNALWIRE_SPACE_URL),
+        "receptionist_provider_ready": bool(
+            settings.SIGNALWIRE_PROJECT_ID
+            and settings.SIGNALWIRE_API_TOKEN
+            and settings.get_webhook_signing_key()
+            and settings.UPSTASH_REDIS_REST_URL
+            and settings.UPSTASH_REDIS_REST_TOKEN
+            and settings.ELEVENLABS_API_KEY
+            and settings.HUGGINGFACE_API_KEY
+            and settings.PUBLIC_URL.startswith("https://")
+        ),
         "signalwire_credentials_configured": bool(settings.SIGNALWIRE_PROJECT_ID and settings.SIGNALWIRE_API_TOKEN),
         "webhook_signature_enforced": settings.ENFORCE_WEBHOOK_SIGNATURE,
         "webhook_signing_key_configured": bool(settings.get_webhook_signing_key()),
