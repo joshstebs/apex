@@ -25,10 +25,10 @@ def fake_urlopen(req, timeout=0):
     return Response()
 with patch("urllib.request.urlopen",fake_urlopen):
     assert engine.synthesize_speech_elevenlabs("Thank you for calling Harbour and Main.")==b"FAKE_MP3_DATA"
-cxml=TelephonyGateway(public_url="https://apex-stebs-co.vercel.app").build_signalwire_cxml_gather(
+cxml=TelephonyGateway(public_url="https://apex.harbourandmain.com").build_signalwire_cxml_gather(
     "sample-callsid","tpl_hm_receptionist","Hello",clip_id="opaque-clip"
 )
-assert "https://apex-stebs-co.vercel.app/api/tts/clip/opaque-clip.mp3" in cxml
+assert "https://apex.harbourandmain.com/api/tts/clip/opaque-clip.mp3" in cxml
 assert "/webhooks/signalwire/gather?" in cxml
 assert "&amp;assistant_id" in cxml
 print("PASS: test number, ElevenLabs voice request, opaque clip and signed callback URL shape")

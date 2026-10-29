@@ -80,7 +80,7 @@ Do not activate live routing until carrier-enforced duration and usage tests pas
 - Receptionist persona: `tpl_hm_receptionist`; ElevenLabs Rachel (`21m00Tcm4TlvDq8ikWAM`),
   model `eleven_turbo_v2_5` for synthesized speech.
 - AI conversational reasoning still uses Hugging Face. **An ElevenLabs API key alone is not enough** for interactive conversation.
-- `PUBLIC_URL=https://apex-stebs-co.vercel.app` for a production deployment which accepts provider POST webhooks.
+- `PUBLIC_URL=https://apex.harbourandmain.com` for a production deployment which accepts provider POST webhooks.
   Deployment Protection must allow only the public signed webhook requests on that hostname;
   all admin data APIs still require `APEX_ADMIN_TOKEN`.
 
@@ -99,9 +99,9 @@ Do not activate live routing until carrier-enforced duration and usage tests pas
 5. In SignalWire Phone Numbers -> +1 226-773-2234 -> Edit Settings ->
    Inbound Call Settings, configure a **Compatibility API / cXML** incoming
    voice webhook (POST) at:
-   `https://apex-stebs-co.vercel.app/webhooks/signalwire/voice`
+   `https://apex.harbourandmain.com/webhooks/signalwire/voice`
    and a call status callback (POST) at
-   `https://apex-stebs-co.vercel.app/webhooks/signalwire/status`.
+   `https://apex.harbourandmain.com/webhooks/signalwire/status`.
    Depending on your SignalWire dashboard, configure a cXML resource using the
    external URL and assign that resource to the number. Do not configure a
    SWML-only handler expecting a SWML response: this application returns cXML.

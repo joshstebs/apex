@@ -67,3 +67,5 @@ This release is a **security and durability improvement, not production-ready li
 - `RECEPTIONIST_ENABLED=false` until live provider validation. No phone route changed.
 
 - Fixed a production smoke-test finding: the obsolete `vercel.json` catch-all rewrite to `/api/index` caused FastAPI 404 at `/` and `/api/health`. Native FastAPI autodetection should handle original request paths.
+
+- Confirmed the branded production hostname `apex.harbourandmain.com` returns HTTP 200, and selected it for PUBLIC_URL and cXML callbacks rather than the temporary Vercel hostname.
