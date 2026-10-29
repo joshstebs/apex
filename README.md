@@ -109,3 +109,10 @@ Do not activate live routing until carrier-enforced duration and usage tests pas
    explicit hangup, provider callback signatures, and actual billable usage.
    No human transfer, outbound calls, staff alerts or actual appointment
    booking is implemented. A 20-minute **exact carrier limit is not verified**.
+
+
+### Vercel FastAPI routing (October 29, 2026)
+The project uses Vercel's native FastAPI detection of root `app.py`.
+Do not add a catch-all rewrite to `/api/index`, which causes FastAPI to receive
+an incorrect path and return HTTP 404 for the main application. The standalone
+`api/index.py` is retained as a legacy compatibility entrypoint only.

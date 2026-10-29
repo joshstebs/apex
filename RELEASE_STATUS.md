@@ -65,3 +65,5 @@ This release is a **security and durability improvement, not production-ready li
 - Added regression fixture for exact DID, ElevenLabs speech request and cXML webhook URLs.
 - Not a completed real-number hookup: SignalWire and ElevenLabs credentials, Hugging Face model credentials and Upstash Redis environment variables, and carrier-side Voice URL routing still need to be configured and verified.
 - `RECEPTIONIST_ENABLED=false` until live provider validation. No phone route changed.
+
+- Fixed a production smoke-test finding: the obsolete `vercel.json` catch-all rewrite to `/api/index` caused FastAPI 404 at `/` and `/api/health`. Native FastAPI autodetection should handle original request paths.
