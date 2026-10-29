@@ -9,6 +9,10 @@ settings.UPSTASH_REDIS_REST_TOKEN='test-only'
 settings.SIGNALWIRE_SIGNING_KEY='test-signature-key'
 settings.ENFORCE_WEBHOOK_SIGNATURE=True
 settings.RECEPTIONIST_ENABLED=True
+# Test-only provider presence flags; no live API calls are made.
+settings.ELEVENLABS_API_KEY="test-only"
+settings.HUGGINGFACE_API_KEY="test-only"
+settings.PUBLIC_URL="https://example.vercel.app"
 redis={}
 def cmd(c):
     op=c[0].upper()
@@ -42,7 +46,7 @@ assert client.post('/api/calls/dispatch',headers={'Authorization':'Bearer test-o
 assert client.get('/api/calls',headers={'Authorization':'Bearer test-only-secret'}).status_code==503
 assert client.get('/').status_code==200
 assert 'cfg_elevenlabs_key' not in client.get('/').text
-params={'CallSid':'CA_secure_1','From':'+15195550000','To':'+12267730802'}
+params={'CallSid':'CA_secure_1','From':'+15195550000','To':'+12267732234'}
 body=urllib.parse.urlencode(params)
 url='https://example.vercel.app/webhooks/signalwire/voice'
 headers={'X-Forwarded-Proto':'https','X-Forwarded-Host':'example.vercel.app','X-SignalWire-Signature':telephony.compute_signalwire_laml_signature(settings.SIGNALWIRE_SIGNING_KEY,url,params),'Content-Type':'application/x-www-form-urlencoded'}
