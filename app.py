@@ -61,7 +61,11 @@ def handle_signalwire_inbound_or_connect(
     Acquires atomic concurrency & budget lock, stores greeting under an opaque short-lived clip_id,
     and returns SignalWire cXML.
     """
-    call_id = params.get("CallSid") or f"call_{uuid.uuid4().hex[:12]}"
+    call_id = (params.get("CallSid") or "").strip()
+    if not call_id:
+        if os.getenv("VERCEL"):
+            return telephony.build_signalwire_cxml_hangup("Invalid call identifier. Goodbye.")
+        call_id = f"call_{uuid.uuid4().hex[:12]}"
     from_number = params.get("From", "Unknown")
     # Only accept incoming calls for the number configured by the operator.
     # This prevents another DID in the same account from being unintentionally answered.
@@ -111,14 +115,19 @@ def handle_signalwire_inbound_or_connect(
         "started_at": datetime.utcnow().isoformat()
     }
 
-    # Atomic concurrency (1 call) and budget ($5.00) lock across simultaneous Vercel instances
-    acquired, err_msg = db.try_acquire_call_slot(call_record)
-    if not acquired:
+    # Atomic admission is the single source of truth for retries and concurrency.
+    try:
+        admitted, _err_msg, outcome = db.try_acquire_call_slot(call_record)
+    except RuntimeError:
+        admitted, outcome = False, None
+    if not admitted:
         return telephony.build_signalwire_cxml_hangup(
             "Sorry, this line is currently busy or has reached its usage limit. Please try again later."
         )
 
-    db.add_transcript_message(call_id, "assistant", greeting, latency_ms=95)
+    replay = outcome == "replay"
+    if not replay:
+        db.add_transcript_message(call_id, "assistant", greeting, latency_ms=95)
     # Create short-lived opaque TTS clip ID (zero conversation text in URL)
     clip_id = None
     if voice_engine.elevenlabs_key and voice_engine.elevenlabs_key.strip():

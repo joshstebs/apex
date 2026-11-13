@@ -22,20 +22,25 @@ def cmd(c):
         redis[c[1]]=c[2];return 'OK'
     if op=='EVAL':
         script=c[1]
-        if 'local spent' in script:
-            lock,spend,call,ttl,reserve,budget=c[3:]
-            if lock in redis or float(redis.get(spend,0))+float(reserve)>float(budget):return 0
-            redis[lock]=call;redis[spend]=str(float(redis.get(spend,0))+float(reserve));return 1
+        if 'local lock = redis.call' in script:
+            lock,spend,marker,call,ttl,reserve_ttl,reserve,budget=c[3:]
+            if redis.get(lock)==call:
+                if marker in redis:return 2
+                return 3
+            if lock in redis:return 0
+            if float(redis.get(spend,0))+float(reserve)>float(budget):return 0
+            redis[lock]=call;redis[spend]=str(float(redis.get(spend,0))+float(reserve));redis[marker]='1';return 1
         if 'local raw' in script:
             key,updates,transcript=c[3:]
             if key not in redis:return 0
             state=json.loads(redis[key]);state['call'].update(json.loads(updates))
             if transcript:state['transcripts'].append(json.loads(transcript))
             redis[key]=json.dumps(state);return 1
-        if "redis.call('DEL'" in script:
-            lock,spend,call,delta=c[3:]
-            if redis.get(lock)!=call:return 0
-            del redis[lock];redis[spend]=str(float(redis.get(spend,0))+float(delta));return 1
+        if "redis.call('GET', KEYS[3])" in script:
+            lock,spend,marker,call,delta=c[3:]
+            if redis.get(marker)!='1':return 0
+            if redis.get(lock)==call:del redis[lock]
+            redis[spend]=str(float(redis.get(spend,0))+float(delta));del redis[marker];return 1
     raise AssertionError('Unmocked Redis operation '+str(c))
 db._upstash_cmd=cmd
 client=TestClient(app)

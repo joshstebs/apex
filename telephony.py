@@ -126,7 +126,15 @@ class TelephonyGateway:
                     return True
 
             if sig_main:
-                expected_sha1 = self.compute_signalwire_laml_signature(key, url, params)
+                # Re-derive the signed parameter set from the raw body so empty
+                # form fields (e.g. Digits= or SpeechResult=) are not dropped.
+                signed_params = params
+                if raw_body:
+                    signed_params = {
+                        k: v[0]
+                        for k, v in urllib.parse.parse_qs(raw_body, keep_blank_values=True).items()
+                    }
+                expected_sha1 = self.compute_signalwire_laml_signature(key, url, signed_params)
                 if hmac.compare_digest(sig_main, expected_sha1):
                     return True
                 expected_raw_sha256 = self.compute_signalwire_sha256_signature(key, url, raw_body)
