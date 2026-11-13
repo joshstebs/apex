@@ -37,24 +37,41 @@ def cmd(c):
     if op == 'EVAL':
         script = c[1]
         eval_log.append(script[:60])
-        # Admission: lock + spend + reservation marker (idempotent per CallSid)
-        if 'local lock = redis.call' in script and 'KEYS[3]' in script:
-            lock, spend, marker, call, ttl, reserve_ttl, reserve, budget, *rest = c[3:]
-            marker_value = rest[0] if rest else json.dumps({'month': __import__('datetime').datetime.utcnow().strftime('%Y-%m'), 'reserve': reserve})
+        # Admission: lock + spend + marker + durable accounting + durable state
+        if 'local lock = redis.call' in script and 'KEYS[5]' in script:
+            lock, spend, marker, acct, state = c[3:8]
+            call, lock_ttl, marker_ttl, reserve, budget, acct_json, acct_ttl = c[8:]
             if redis.get(lock) == call:
-                if marker in redis:
+                if acct in redis or marker in redis:
                     return 2
                 return 3
             if lock in redis:
                 return 0
+            raw_state = redis.get(state)
+            if raw_state:
+                try:
+                    decoded = json.loads(raw_state)
+                except Exception:
+                    decoded = None
+                if isinstance(decoded, dict) and isinstance(decoded.get('call'), dict):
+                    if decoded['call'].get('status') == 'in-progress' and isinstance(decoded.get('accounting'), dict):
+                        acct_value = json.dumps(decoded['accounting'])
+                        redis[lock] = call
+                        redis[acct] = acct_value
+                        redis[marker] = acct_value
+                        return 4
+                    return 5
+            if acct in redis:
+                return 5
             if float(redis.get(spend, 0)) + float(reserve) > float(budget):
                 return 0
             redis[lock] = call
             redis[spend] = str(float(redis.get(spend, 0)) + float(reserve))
-            redis[marker] = marker_value
+            redis[acct] = acct_json
+            redis[marker] = acct_json
             return 1
         # Atomic state update
-        if 'local raw' in script:
+        if "local raw = redis.call('GET', KEYS[1])" in script:
             key, updates, transcript = c[3:]
             if key not in redis:
                 return 0
@@ -64,15 +81,26 @@ def cmd(c):
                 state['transcripts'].append(json.loads(transcript))
             redis[key] = json.dumps(state)
             return 1
-        # Idempotent release / budget reconciliation
-        if "redis.call('GET', KEYS[3])" in script and 'INCRBYFLOAT' in script and 'DEL' in script:
-            lock, spend, marker, call, delta = c[3:]
-            if marker not in redis:
+        # Idempotent release / budget reconciliation (durable accounting is authoritative)
+        if "local raw = redis.call('GET', KEYS[3])" in script:
+            lock, spend, acct, marker = c[3:7]
+            call, delta, now, acct_ttl = c[7:]
+            raw = redis.get(acct)
+            if not raw:
                 return 0
+            try:
+                accounting = json.loads(raw)
+            except Exception:
+                return 3
+            if accounting.get('reconciled') is True:
+                return 2
             if redis.get(lock) == call:
-                del redis[lock]
+                redis.pop(lock, None)
             redis[spend] = str(float(redis.get(spend, 0)) + float(delta))
-            del redis[marker]
+            accounting['reconciled'] = True
+            accounting['reconciled_at'] = now
+            redis[acct] = json.dumps(accounting)
+            redis.pop(marker, None)
             return 1
         raise AssertionError('Unmocked EVAL: ' + script[:120])
     raise AssertionError('Unmocked Redis operation ' + str(c))
@@ -148,14 +176,16 @@ call_id = 'CA_race_1'
 month_key = __import__('datetime').datetime.utcnow().strftime('%Y-%m')
 redis['apex:active_call_lock'] = call_id
 redis[f'apex:spend:{month_key}'] = '3.0'
-redis[f'apex:reserve:{call_id}'] = '1'
+redis[f'apex:acct:{call_id}'] = json.dumps({'call_id': call_id, 'month': month_key, 'reserve': 3.0, 'reconciled': False})
+redis[f'apex:reserve:{call_id}'] = json.dumps({'call_id': call_id, 'month': month_key, 'reserve': 3.0, 'reconciled': False})
 # state intentionally absent
 r = signed_voice_post({'CallSid': call_id, 'From': '+15195550000', 'To': '+12267732234'})
 assert r.status_code == 200 and '<Gather' in r.text, r.text
 state = json.loads(redis.get(f'apex:call:{call_id}') or 'null')
 assert state is not None and state.get('call', {}).get('id') == call_id, state
 assert float(redis.get(f'apex:spend:{month_key}', 0)) == 3.0, 'reservation must not double-charge on recovery'
-assert redis.get(f'apex:reserve:{call_id}') == '1'
+marker=json.loads(redis.get(f'apex:reserve:{call_id}')); assert marker.get('month')==month_key and float(marker.get('reserve',0))==3.0, marker
+assert json.loads(redis.get(f'apex:acct:{call_id}')).get('reconciled') is False
 print('PASS: lock-before-state race recovered without double reservation')
 
 
@@ -168,9 +198,10 @@ redis[f'apex:spend:{month_key}'] = '3.0'
 redis[f'apex:call:{call_id}'] = json.dumps({
     'call': {'id': call_id, 'assistant_id': 'tpl_hm_receptionist', 'status': 'in-progress',
              'started_at': __import__('datetime').datetime.utcnow().isoformat()},
-    'transcripts': [{'speaker': 'assistant', 'message': 'hi', 'latency_ms': 1}]
+    'transcripts': [{'speaker': 'assistant', 'message': 'hi', 'latency_ms': 1}],
+    'accounting': {'call_id': call_id, 'month': month_key, 'reserve': 3.0, 'reconciled': False},
 })
-# marker intentionally absent
+# marker and durable accounting intentionally absent (expired)
 r = signed_voice_post({'CallSid': call_id, 'From': '+15195550000', 'To': '+12267732234'})
 assert r.status_code == 200 and '<Gather' in r.text, r.text
 state = json.loads(redis[f'apex:call:{call_id}'])
@@ -199,12 +230,12 @@ month_key = __import__('datetime').datetime.utcnow().strftime('%Y-%m')
 call_id = 'CA_release'
 redis['apex:active_call_lock'] = call_id
 redis[f'apex:spend:{month_key}'] = '3.0'
-redis[f'apex:reserve:{call_id}'] = json.dumps({'month': month_key, 'reserve': 3.0})
+redis[f'apex:acct:{call_id}'] = json.dumps({'call_id': call_id, 'month': month_key, 'reserve': 3.0, 'reconciled': False})
 ok, err, outcome = db.release_call_slot(call_id, cost_delta=1.2)
 assert (ok, err, outcome) == (True, None, 'released'), (ok, err, outcome)
 assert abs(float(redis[f'apex:spend:{month_key}']) - 1.2) < 1e-9, redis[f'apex:spend:{month_key}']
 assert redis.get('apex:active_call_lock') is None
-assert f'apex:reserve:{call_id}' not in redis
+assert json.loads(redis[f'apex:acct:{call_id}']).get('reconciled') is True
 # Duplicate/delayed callback must not refund or charge again (total cost, not incremental).
 ok, err, outcome = db.release_call_slot(call_id, cost_delta=0.5)
 assert (ok, err, outcome) == (True, None, 'already_released'), (ok, err, outcome)
@@ -218,7 +249,7 @@ month_key = __import__('datetime').datetime.utcnow().strftime('%Y-%m')
 call_id = 'CA_lock_expired'
 # lock gone, marker present
 redis[f'apex:spend:{month_key}'] = '3.0'
-redis[f'apex:reserve:{call_id}'] = json.dumps({'month': month_key, 'reserve': 3.0})
+redis[f'apex:acct:{call_id}'] = json.dumps({'call_id': call_id, 'month': month_key, 'reserve': 3.0, 'reconciled': False})
 ok, err, outcome = db.release_call_slot(call_id, cost_delta=0.8)
 assert (ok, err, outcome) == (True, None, 'released'), (ok, err, outcome)
 assert abs(float(redis[f'apex:spend:{month_key}']) - 0.8) < 1e-9, redis[f'apex:spend:{month_key}']

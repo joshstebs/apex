@@ -22,26 +22,43 @@ def cmd(c):
         redis[c[1]]=c[2];return 'OK'
     if op=='EVAL':
         script=c[1]
-        if 'local lock = redis.call' in script:
-            lock,spend,marker,call,ttl,reserve_ttl,reserve,budget,*rest=c[3:]
-            marker_value = rest[0] if rest else json.dumps({'month': __import__('datetime').datetime.utcnow().strftime('%Y-%m'), 'reserve': reserve})
+        if 'local lock = redis.call' in script and 'KEYS[5]' in script:
+            lock,spend,marker,acct,state=c[3:8]
+            call,lock_ttl,marker_ttl,reserve,budget,acct_json,acct_ttl=c[8:]
             if redis.get(lock)==call:
-                if marker in redis:return 2
+                if acct in redis or marker in redis:return 2
                 return 3
             if lock in redis:return 0
+            raw_state=redis.get(state)
+            if raw_state:
+                try: decoded=json.loads(raw_state)
+                except Exception: decoded=None
+                if isinstance(decoded,dict) and isinstance(decoded.get('call'),dict):
+                    if decoded['call'].get('status')=='in-progress' and isinstance(decoded.get('accounting'),dict):
+                        acct_value=json.dumps(decoded['accounting'])
+                        redis[lock]=call;redis[acct]=acct_value;redis[marker]=acct_value;return 4
+                    return 5
+            if acct in redis:return 5
             if float(redis.get(spend,0))+float(reserve)>float(budget):return 0
-            redis[lock]=call;redis[spend]=str(float(redis.get(spend,0))+float(reserve));redis[marker]=marker_value;return 1
-        if 'local raw' in script:
+            redis[lock]=call;redis[spend]=str(float(redis.get(spend,0))+float(reserve));redis[acct]=acct_json;redis[marker]=acct_json;return 1
+        if "local raw = redis.call('GET', KEYS[1])" in script:
             key,updates,transcript=c[3:]
             if key not in redis:return 0
             state=json.loads(redis[key]);state['call'].update(json.loads(updates))
             if transcript:state['transcripts'].append(json.loads(transcript))
             redis[key]=json.dumps(state);return 1
-        if "redis.call('GET', KEYS[3])" in script and 'INCRBYFLOAT' in script and 'DEL' in script:
-            lock,spend,marker,call,delta=c[3:]
-            if marker not in redis:return 0
-            if redis.get(lock)==call:del redis[lock]
-            redis[spend]=str(float(redis.get(spend,0))+float(delta));del redis[marker];return 1
+        if "local raw = redis.call('GET', KEYS[3])" in script:
+            lock,spend,acct,marker=c[3:7]
+            call,delta,now,acct_ttl=c[7:]
+            raw=redis.get(acct)
+            if not raw:return 0
+            try: accounting=json.loads(raw)
+            except Exception: return 3
+            if accounting.get('reconciled') is True:return 2
+            if redis.get(lock)==call:redis.pop(lock,None)
+            redis[spend]=str(float(redis.get(spend,0))+float(delta))
+            accounting['reconciled']=True;accounting['reconciled_at']=now
+            redis[acct]=json.dumps(accounting);redis.pop(marker,None);return 1
     raise AssertionError('Unmocked Redis operation '+str(c))
 db._upstash_cmd=cmd
 client=TestClient(app)
