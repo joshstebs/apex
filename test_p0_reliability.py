@@ -39,7 +39,8 @@ def cmd(c):
         eval_log.append(script[:60])
         # Admission: lock + spend + reservation marker (idempotent per CallSid)
         if 'local lock = redis.call' in script and 'KEYS[3]' in script:
-            lock, spend, marker, call, ttl, reserve_ttl, reserve, budget = c[3:]
+            lock, spend, marker, call, ttl, reserve_ttl, reserve, budget, *rest = c[3:]
+            marker_value = rest[0] if rest else json.dumps({'month': __import__('datetime').datetime.utcnow().strftime('%Y-%m'), 'reserve': reserve})
             if redis.get(lock) == call:
                 if marker in redis:
                     return 2
@@ -50,7 +51,7 @@ def cmd(c):
                 return 0
             redis[lock] = call
             redis[spend] = str(float(redis.get(spend, 0)) + float(reserve))
-            redis[marker] = '1'
+            redis[marker] = marker_value
             return 1
         # Atomic state update
         if 'local raw' in script:
@@ -66,7 +67,7 @@ def cmd(c):
         # Idempotent release / budget reconciliation
         if "redis.call('GET', KEYS[3])" in script and 'INCRBYFLOAT' in script and 'DEL' in script:
             lock, spend, marker, call, delta = c[3:]
-            if redis.get(marker) != '1':
+            if marker not in redis:
                 return 0
             if redis.get(lock) == call:
                 del redis[lock]
@@ -137,7 +138,7 @@ transcripts = state.get('transcripts', [])
 assistant_greetings = [t for t in transcripts if t.get('speaker') == 'assistant']
 assert len(assistant_greetings) == 1, transcripts
 assert float(redis.get('apex:spend:{}'.format(__import__('datetime').datetime.utcnow().strftime('%Y-%m')), 0)) == 3.0, redis
-assert redis.get('apex:reserve:CA_retry_1') == '1'
+marker = json.loads(redis.get('apex:reserve:CA_retry_1')); assert marker.get('month') and float(marker.get('reserve',0)) > 0
 print('PASS: same-CallSid retry reuses state without duplicate greeting/reservation')
 
 
@@ -175,7 +176,7 @@ assert r.status_code == 200 and '<Gather' in r.text, r.text
 state = json.loads(redis[f'apex:call:{call_id}'])
 assert len(state['transcripts']) == 1, state['transcripts']
 assert float(redis.get(f'apex:spend:{month_key}', 0)) == 3.0, 'must not re-reserve when lock/state exist'
-assert redis.get(f'apex:reserve:{call_id}') == '1', 'marker must be re-armed for idempotent reconciliation'
+marker=json.loads(redis.get(f'apex:reserve:{call_id}')); assert marker.get('month')==month_key and float(marker.get('reserve',0))==3.0, marker
 print('PASS: expired reservation marker re-armed without duplicate reservation/transcript')
 
 
@@ -198,15 +199,17 @@ month_key = __import__('datetime').datetime.utcnow().strftime('%Y-%m')
 call_id = 'CA_release'
 redis['apex:active_call_lock'] = call_id
 redis[f'apex:spend:{month_key}'] = '3.0'
-redis[f'apex:reserve:{call_id}'] = '1'
-db.release_call_slot(call_id, cost_delta=1.2)
+redis[f'apex:reserve:{call_id}'] = json.dumps({'month': month_key, 'reserve': 3.0})
+ok, err, outcome = db.release_call_slot(call_id, cost_delta=1.2)
+assert (ok, err, outcome) == (True, None, 'released'), (ok, err, outcome)
 assert abs(float(redis[f'apex:spend:{month_key}']) - 1.2) < 1e-9, redis[f'apex:spend:{month_key}']
 assert redis.get('apex:active_call_lock') is None
 assert f'apex:reserve:{call_id}' not in redis
-# Duplicate/delayed callback must not refund or charge again.
-db.release_call_slot(call_id, cost_delta=0.5)
+# Duplicate/delayed callback must not refund or charge again (total cost, not incremental).
+ok, err, outcome = db.release_call_slot(call_id, cost_delta=0.5)
+assert (ok, err, outcome) == (True, None, 'already_released'), (ok, err, outcome)
 assert abs(float(redis[f'apex:spend:{month_key}']) - 1.2) < 1e-9, redis[f'apex:spend:{month_key}']
-print('PASS: budget release idempotent on duplicate/delayed callbacks')
+print('PASS: budget release idempotent on duplicate/delayed callbacks (total cost semantics)')
 
 
 # 7) Release reconciles correctly even if lock already expired (marker still present)
@@ -215,10 +218,12 @@ month_key = __import__('datetime').datetime.utcnow().strftime('%Y-%m')
 call_id = 'CA_lock_expired'
 # lock gone, marker present
 redis[f'apex:spend:{month_key}'] = '3.0'
-redis[f'apex:reserve:{call_id}'] = '1'
-db.release_call_slot(call_id, cost_delta=0.8)
+redis[f'apex:reserve:{call_id}'] = json.dumps({'month': month_key, 'reserve': 3.0})
+ok, err, outcome = db.release_call_slot(call_id, cost_delta=0.8)
+assert (ok, err, outcome) == (True, None, 'released'), (ok, err, outcome)
 assert abs(float(redis[f'apex:spend:{month_key}']) - 0.8) < 1e-9, redis[f'apex:spend:{month_key}']
-db.release_call_slot(call_id, cost_delta=0.0)
+ok, err, outcome = db.release_call_slot(call_id, cost_delta=0.0)
+assert (ok, err, outcome) == (True, None, 'already_released'), (ok, err, outcome)
 assert abs(float(redis[f'apex:spend:{month_key}']) - 0.8) < 1e-9, redis[f'apex:spend:{month_key}']
 print('PASS: release reconciles when lock expired and is idempotent')
 

@@ -279,6 +279,8 @@ class Database:
             reserve, reserve_err = self._call_reserve_usd()
             if reserve_err:
                 return False, reserve_err, None
+            marker_value = json.dumps({"month": month_key, "reserve": reserve})
+            marker_ttl = str(settings.MAX_CALL_DURATION_SECONDS + 60)
             # KEYS: 1=active call lock, 2=monthly spend, 3=reservation marker for this CallSid
             script = """
             local lock = redis.call('GET', KEYS[1])
@@ -291,15 +293,15 @@ class Database:
             if spent + tonumber(ARGV[4]) > tonumber(ARGV[5]) then return 0 end
             redis.call('SET', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[2]))
             redis.call('INCRBYFLOAT', KEYS[2], ARGV[4])
-            redis.call('SET', KEYS[3], '1', 'EX', tonumber(ARGV[3]))
+            redis.call('SET', KEYS[3], ARGV[6], 'EX', tonumber(ARGV[3]))
             return 1
             """
             try:
                 ok = self._upstash_cmd(["EVAL", script, "3", "apex:active_call_lock",
                                         f"apex:spend:{month_key}", f"apex:reserve:{call_id}", call_id,
                                         str(settings.MAX_CALL_DURATION_SECONDS + 15),
-                                        str(settings.MAX_CALL_DURATION_SECONDS + 60),
-                                        str(reserve), str(settings.MONTHLY_BUDGET_LIMIT_USD)])
+                                        marker_ttl, str(reserve), str(settings.MONTHLY_BUDGET_LIMIT_USD),
+                                        marker_value])
             except RuntimeError:
                 return False, "Durable budget/lock store unavailable", None
             if ok == 0:
@@ -318,7 +320,7 @@ class Database:
                 if os.getenv("VERCEL"):
                     try:
                         self.ensure_durable_call_state(call_id, {"call": call_record, "transcripts": []})
-                        self._upstash_cmd(["SET", f"apex:reserve:{call_id}", "1", "EX", str(settings.MAX_CALL_DURATION_SECONDS + 60)])
+                        self._upstash_cmd(["SET", f"apex:reserve:{call_id}", marker_value, "EX", marker_ttl])
                     except Exception:
                         return False, "Durable call state unavailable", None
                 return True, None, "replay"
@@ -389,27 +391,60 @@ class Database:
         return True, None, "created"
 
     def release_call_slot(self, call_id: str, cost_delta: float = 0.0):
-        """Release the call's slot and reconcile the reservation exactly once."""
+        """Release the call's slot and reconcile the reservation exactly once.
+
+        cost_delta is the expected total incurred cost for the call (not an incremental delta).
+        Returns (ok, error, outcome) where outcome is "released", "already_released", or None.
+        Redis errors and unsuccessful reconciliation are reported as failures.
+        """
         if settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN:
+            try:
+                marker_raw = self._upstash_cmd(["GET", f"apex:reserve:{call_id}"])
+            except RuntimeError:
+                return False, "Durable budget/lock store unavailable", None
+            if not marker_raw:
+                return True, None, "already_released"
+            # Marker stores the admission month and reserved amount so reconciliation
+            # happens against the same spend bucket even across month boundaries.
             month_key = datetime.utcnow().strftime("%Y-%m")
             reserve, reserve_err = self._call_reserve_usd()
             if reserve_err:
-                return False, reserve_err
+                return False, reserve_err, None
+            marker_month = month_key
+            if isinstance(marker_raw, str):
+                try:
+                    marker = json.loads(marker_raw)
+                    if isinstance(marker, dict):
+                        marker_month = str(marker.get("month") or month_key)
+                        reserve = float(marker.get("reserve", reserve))
+                except Exception:
+                    # Legacy "1" markers fall back to current month/current reserve config.
+                    pass
             script = """
-            if redis.call('GET', KEYS[3]) ~= '1' then return 0 end
+            local marker = redis.call('GET', KEYS[3])
+            if not marker then return 0 end
             if redis.call('GET', KEYS[1]) == ARGV[1] then redis.call('DEL', KEYS[1]) end
             redis.call('INCRBYFLOAT', KEYS[2], ARGV[2])
             redis.call('DEL', KEYS[3])
             return 1
             """
             try:
-                self._upstash_cmd(["EVAL", script, "3", "apex:active_call_lock",
-                                   f"apex:spend:{month_key}", f"apex:reserve:{call_id}", call_id,
-                                   str(max(0.0, cost_delta) - reserve)])
+                result = self._upstash_cmd(["EVAL", script, "3", "apex:active_call_lock",
+                                            f"apex:spend:{marker_month}", f"apex:reserve:{call_id}", call_id,
+                                            str(max(0.0, float(cost_delta)) - reserve)])
             except RuntimeError:
-                # Do not permit another call if durable accounting cannot be updated.
-                pass
-            return True, None
+                return False, "Durable budget/lock store unavailable", None
+            if result != 1:
+                # Marker was removed by a concurrent release or expired between read and EVAL.
+                try:
+                    still_present = self._upstash_cmd(["GET", f"apex:reserve:{call_id}"])
+                except RuntimeError:
+                    return False, "Durable budget/lock store unavailable", None
+                if not still_present:
+                    return True, None, "already_released"
+                return False, "Budget reconciliation not confirmed", None
+            return True, None, "released"
+        return True, None, "released"
 
     def save_durable_call_state(self, call_id: str, state_payload: Dict[str, Any]):
         """Creates initial state; subsequent mutations use atomic Redis updates."""

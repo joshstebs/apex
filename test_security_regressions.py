@@ -23,22 +23,23 @@ def cmd(c):
     if op=='EVAL':
         script=c[1]
         if 'local lock = redis.call' in script:
-            lock,spend,marker,call,ttl,reserve_ttl,reserve,budget=c[3:]
+            lock,spend,marker,call,ttl,reserve_ttl,reserve,budget,*rest=c[3:]
+            marker_value = rest[0] if rest else json.dumps({'month': __import__('datetime').datetime.utcnow().strftime('%Y-%m'), 'reserve': reserve})
             if redis.get(lock)==call:
                 if marker in redis:return 2
                 return 3
             if lock in redis:return 0
             if float(redis.get(spend,0))+float(reserve)>float(budget):return 0
-            redis[lock]=call;redis[spend]=str(float(redis.get(spend,0))+float(reserve));redis[marker]='1';return 1
+            redis[lock]=call;redis[spend]=str(float(redis.get(spend,0))+float(reserve));redis[marker]=marker_value;return 1
         if 'local raw' in script:
             key,updates,transcript=c[3:]
             if key not in redis:return 0
             state=json.loads(redis[key]);state['call'].update(json.loads(updates))
             if transcript:state['transcripts'].append(json.loads(transcript))
             redis[key]=json.dumps(state);return 1
-        if "redis.call('GET', KEYS[3])" in script:
+        if "redis.call('GET', KEYS[3])" in script and 'INCRBYFLOAT' in script and 'DEL' in script:
             lock,spend,marker,call,delta=c[3:]
-            if redis.get(marker)!='1':return 0
+            if marker not in redis:return 0
             if redis.get(lock)==call:del redis[lock]
             redis[spend]=str(float(redis.get(spend,0))+float(delta));del redis[marker];return 1
     raise AssertionError('Unmocked Redis operation '+str(c))

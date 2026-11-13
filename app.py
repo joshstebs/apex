@@ -174,14 +174,14 @@ def handle_signalwire_gather_turn(
         return telephony.build_signalwire_cxml_hangup("Unable to verify call duration. Goodbye.")
     if new_duration >= settings.MAX_CALL_DURATION_SECONDS:
         cost_info = VoiceEngine.calculate_call_cost(settings.MAX_CALL_DURATION_SECONDS, provider="signalwire")
-        prev_cost = float(call.get("cost_total", 0.0) or 0.0)
         db.update_call(call_id, {
             "status": "completed",
             "duration_seconds": settings.MAX_CALL_DURATION_SECONDS,
             "ended_at": datetime.utcnow().isoformat(),
             "cost_total": cost_info["cost_total"]
         })
-        db.release_call_slot(call_id, cost_delta=max(0.0, cost_info["cost_total"] - prev_cost))
+        # release_call_slot expects expected TOTAL incurred cost, not an incremental delta.
+        db.release_call_slot(call_id, cost_delta=cost_info["cost_total"])
         return telephony.build_signalwire_cxml_hangup(
             f"We have reached our {settings.MAX_CALL_DURATION_SECONDS // 60} minute call time limit. Thank you and goodbye!"
         )
