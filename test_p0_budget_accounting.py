@@ -55,12 +55,36 @@ def cmd(c):
                 except Exception:
                     decoded = None
                 if isinstance(decoded, dict) and isinstance(decoded.get('call'), dict):
-                    if decoded['call'].get('status') == 'in-progress' and isinstance(decoded.get('accounting'), dict):
-                        acct_value = json.dumps(decoded['accounting'])
-                        redis[lock] = call
-                        redis[acct] = acct_value
-                        redis[marker] = acct_value
-                        return 4
+                    if decoded['call'].get('status') == 'in-progress':
+                        acct_raw = redis.get(acct)
+                        if acct_raw is not None:
+                            try:
+                                acct_obj = json.loads(acct_raw)
+                            except Exception:
+                                return 5
+                            if not isinstance(acct_obj, dict) or acct_obj.get('reconciled') is True:
+                                return 5
+                            redis[lock] = call
+                            redis[marker] = acct_raw
+                            return 4
+                        state_acct = decoded.get('accounting')
+                        if isinstance(state_acct, dict) and state_acct.get('reconciled') is not True:
+                            state_json = json.dumps(state_acct)
+                            chosen = state_json
+                            if acct not in redis:
+                                redis[acct] = state_json
+                            else:
+                                chosen = redis[acct]
+                                try:
+                                    racing = json.loads(chosen)
+                                except Exception:
+                                    return 5
+                                if not isinstance(racing, dict) or racing.get('reconciled') is True:
+                                    return 5
+                            redis[lock] = call
+                            redis[marker] = chosen
+                            return 4
+                        return 5
                     return 5
             if acct in redis:
                 return 5

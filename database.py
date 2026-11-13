@@ -301,12 +301,33 @@ class Database:
             if state_raw then
               local decoded, state = pcall(cjson.decode, state_raw)
               if decoded and type(state) == 'table' and type(state['call']) == 'table' then
-                if state['call']['status'] == 'in-progress' and type(state['accounting']) == 'table' then
-                  local acct_json = cjson.encode(state['accounting'])
-                  redis.call('SET', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[2]))
-                  redis.call('SET', KEYS[4], acct_json, 'EX', tonumber(ARGV[7]))
-                  redis.call('SET', KEYS[3], acct_json, 'EX', tonumber(ARGV[3]))
-                  return 4
+                if state['call']['status'] == 'in-progress' then
+                  -- Authoritative accounting always wins over possibly stale call state.
+                  local acct_raw = redis.call('GET', KEYS[4])
+                  if acct_raw then
+                    local acct_ok, acct = pcall(cjson.decode, acct_raw)
+                    if not acct_ok or type(acct) ~= 'table' or acct['reconciled'] == true then return 5 end
+                    redis.call('SET', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[2]))
+                    redis.call('SET', KEYS[3], acct_raw, 'EX', tonumber(ARGV[3]))
+                    return 4
+                  end
+                  local state_acct = state['accounting']
+                  if type(state_acct) == 'table' and state_acct['reconciled'] ~= true then
+                    local state_json = cjson.encode(state_acct)
+                    local armed = redis.call('SET', KEYS[4], state_json, 'NX', 'EX', tonumber(ARGV[7]))
+                    local chosen = state_json
+                    if not armed then
+                      local racing = redis.call('GET', KEYS[4])
+                      if not racing then return 5 end
+                      local racing_ok, racing_acct = pcall(cjson.decode, racing)
+                      if not racing_ok or type(racing_acct) ~= 'table' or racing_acct['reconciled'] == true then return 5 end
+                      chosen = racing
+                    end
+                    redis.call('SET', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[2]))
+                    redis.call('SET', KEYS[3], chosen, 'EX', tonumber(ARGV[3]))
+                    return 4
+                  end
+                  return 5
                 end
                 return 5
               end

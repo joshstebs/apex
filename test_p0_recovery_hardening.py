@@ -53,12 +53,36 @@ def cmd(c):
                 except Exception:
                     decoded = None
                 if isinstance(decoded, dict) and isinstance(decoded.get('call'), dict):
-                    if decoded['call'].get('status') == 'in-progress' and isinstance(decoded.get('accounting'), dict):
-                        acct_value = json.dumps(decoded['accounting'])
-                        redis[lock] = call
-                        redis[acct] = acct_value
-                        redis[marker] = acct_value
-                        return 4
+                    if decoded['call'].get('status') == 'in-progress':
+                        acct_raw = redis.get(acct)
+                        if acct_raw is not None:
+                            try:
+                                acct_obj = json.loads(acct_raw)
+                            except Exception:
+                                return 5
+                            if not isinstance(acct_obj, dict) or acct_obj.get('reconciled') is True:
+                                return 5
+                            redis[lock] = call
+                            redis[marker] = acct_raw
+                            return 4
+                        state_acct = decoded.get('accounting')
+                        if isinstance(state_acct, dict) and state_acct.get('reconciled') is not True:
+                            state_json = json.dumps(state_acct)
+                            chosen = state_json
+                            if acct not in redis:
+                                redis[acct] = state_json
+                            else:
+                                chosen = redis[acct]
+                                try:
+                                    racing = json.loads(chosen)
+                                except Exception:
+                                    return 5
+                                if not isinstance(racing, dict) or racing.get('reconciled') is True:
+                                    return 5
+                            redis[lock] = call
+                            redis[marker] = chosen
+                            return 4
+                        return 5
                     return 5
             if acct in redis:
                 return 5
@@ -259,5 +283,88 @@ ok, err, outcome = db.release_call_slot(call_id, cost_delta=0.7)
 assert (ok, err, outcome) == (True, None, 'released'), (ok, err, outcome)
 assert abs(float(redis[f'apex:spend:{m}']) - 0.7) < 1e-9
 print('PASS: repeated recovery adds no charges and reconciles once')
+
+
+# 7) Reconciled accounting must win over stale in-progress call state
+reset_state()
+m = month_key()
+call_id = 'CA_stale_reconciled'
+redis[f'apex:spend:{m}'] = '1.0'
+redis[f'apex:acct:{call_id}'] = json.dumps({'call_id': call_id, 'month': m, 'reserve': 3.0, 'reconciled': True})
+redis[f'apex:call:{call_id}'] = json.dumps({
+    'call': {'id': call_id, 'status': 'in-progress', 'started_at': __import__('datetime').datetime.utcnow().isoformat()},
+    'transcripts': [],
+    'accounting': {'call_id': call_id, 'month': m, 'reserve': 3.0, 'reconciled': False},
+})
+acct_before = redis[f'apex:acct:{call_id}']
+admitted, err, outcome = db.try_acquire_call_slot({'id': call_id, 'phone_number': '+15195550000', 'assistant_id': 'tpl_hm_receptionist'})
+assert (admitted, outcome) == (False, 'duplicate'), (admitted, err, outcome)
+assert redis.get('apex:active_call_lock') is None, 'reconciled call must not be reactivated'
+assert redis[f'apex:acct:{call_id}'] == acct_before, 'reconciled accounting must not be overwritten'
+assert abs(float(redis[f'apex:spend:{m}']) - 1.0) < 1e-9
+print('PASS: reconciled accounting with stale in-progress state is not reactivated')
+
+# 8) Duplicate inbound webhook after partial completion failure (released, state update failed)
+reset_state()
+m = month_key()
+call_id = 'CA_partial_complete'
+entry = {'CallSid': call_id, 'From': '+15195550000', 'To': '+12267732234'}
+r = signed_voice_post(entry)
+assert r.status_code == 200 and '<Gather' in r.text
+ok, err, outcome = db.release_call_slot(call_id, cost_delta=1.3)
+assert (ok, err, outcome) == (True, None, 'released'), (ok, err, outcome)
+# simulate failed status update: state still says in-progress
+state = json.loads(redis[f'apex:call:{call_id}'])
+assert state['call']['status'] == 'in-progress'
+acct_before = redis[f'apex:acct:{call_id}']
+spend_before = float(redis[f'apex:spend:{m}'])
+r2 = signed_voice_post(entry)
+assert r2.status_code == 200
+assert '<Hangup' in r2.text and '<Gather' not in r2.text, r2.text
+assert redis.get('apex:active_call_lock') is None
+assert redis[f'apex:acct:{call_id}'] == acct_before
+assert abs(float(redis[f'apex:spend:{m}']) - spend_before) < 1e-9
+print('PASS: duplicate inbound webhook after partial completion failure is refused safely')
+
+# 9) Deterministic release/admission interleavings (real Redis concurrency not available here)
+reset_state()
+m = month_key()
+call_id_a = 'CA_interleave_a'
+redis['apex:active_call_lock'] = call_id_a
+redis[f'apex:spend:{m}'] = '3.0'
+redis[f'apex:acct:{call_id_a}'] = json.dumps({'call_id': call_id_a, 'month': m, 'reserve': 3.0, 'reconciled': False})
+redis[f'apex:call:{call_id_a}'] = json.dumps({
+    'call': {'id': call_id_a, 'status': 'in-progress'},
+    'transcripts': [],
+    'accounting': {'call_id': call_id_a, 'month': m, 'reserve': 3.0, 'reconciled': False},
+})
+record_a = {'id': call_id_a, 'phone_number': '+15195550000', 'assistant_id': 'tpl_hm_receptionist'}
+a1 = db.try_acquire_call_slot(record_a)
+assert (a1[0], a1[2]) == (True, 'replay'), a1
+assert abs(float(redis[f'apex:spend:{m}']) - 3.0) < 1e-9
+a2 = db.release_call_slot(call_id_a, cost_delta=1.0)
+assert a2 == (True, None, 'released'), a2
+a3 = db.try_acquire_call_slot(record_a)
+assert (a3[0], a3[2]) == (False, 'duplicate'), a3
+assert abs(float(redis[f'apex:spend:{m}']) - 1.0) < 1e-9
+
+reset_state()
+call_id_b = 'CA_interleave_b'
+redis['apex:active_call_lock'] = call_id_b
+redis[f'apex:spend:{m}'] = '3.0'
+redis[f'apex:acct:{call_id_b}'] = json.dumps({'call_id': call_id_b, 'month': m, 'reserve': 3.0, 'reconciled': False})
+redis[f'apex:call:{call_id_b}'] = json.dumps({
+    'call': {'id': call_id_b, 'status': 'in-progress'},
+    'transcripts': [],
+    'accounting': {'call_id': call_id_b, 'month': m, 'reserve': 3.0, 'reconciled': False},
+})
+record_b = {'id': call_id_b, 'phone_number': '+15195550001', 'assistant_id': 'tpl_hm_receptionist'}
+b1 = db.release_call_slot(call_id_b, cost_delta=1.0)
+assert b1 == (True, None, 'released'), b1
+b2 = db.try_acquire_call_slot(record_b)
+assert (b2[0], b2[2]) == (False, 'duplicate'), b2
+assert abs(float(redis[f'apex:spend:{m}']) - 1.0) < 1e-9
+print('PASS: deterministic release/admission interleavings avoid reactivation and double charges')
+print('NOTE: true concurrent execution against real Redis is UNVERIFIED (no isolated Redis instance available)')
 
 print('ALL P0 RECOVERY HARDENING TESTS PASSED')
