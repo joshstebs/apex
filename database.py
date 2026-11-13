@@ -17,6 +17,9 @@ from typing import List, Dict, Any, Optional, Tuple
 from config import settings
 
 class Database:
+    # Durable accounting outlives the short marker and 24h call-state TTL.
+    ACCOUNTING_TTL_SECONDS = 604800
+
     def __init__(self, db_path: str = None):
         self.db_path = db_path or settings.DB_PATH
         if not os.getenv("VERCEL"):
@@ -251,49 +254,144 @@ class Database:
     # -------------------------------------------------------------------------
     # ATOMIC CONCURRENCY LOCK & SPENDING COUNTERS ACROSS VERCEL INSTANCES
     # -------------------------------------------------------------------------
-    def try_acquire_call_slot(self, call_record: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+    def _call_reserve_usd(self) -> Tuple[Optional[float], Optional[str]]:
+        """Reads the per-call budget reservation; fails closed on bad configuration."""
+        try:
+            reserve = float(os.getenv("APEX_MAX_CALL_RESERVE_USD", "3.00"))
+        except (TypeError, ValueError):
+            return None, "Invalid call budget reservation"
+        # Fail closed if a full-duration call cannot fit the configured budget reserve.
+        if reserve <= 0 or reserve > settings.MONTHLY_BUDGET_LIMIT_USD:
+            return None, "Invalid call budget reservation"
+        return reserve, None
+
+    def try_acquire_call_slot(self, call_record: Dict[str, Any]) -> Tuple[bool, Optional[str], Optional[str]]:
         """
-        Atomically checks $5.00 monthly budget cap and 1-concurrent-call limit across instances,
-        and registers the call as active if permitted.
+        Atomically checks $5.00 monthly budget cap and 1-concurrent-call limit across instances.
+        Returns (admitted, error, outcome) where outcome is "created" for a fresh admission,
+        "replay" for a same-CallSid retry/recovery that reused its existing reservation, and
+        "duplicate" when a known completed CallSid must not be re-admitted as billable.
         """
         call_id = call_record["id"]
         month_key = datetime.utcnow().strftime("%Y-%m")
 
+        state_payload = {"call": call_record, "transcripts": []}
         # A single Redis Lua operation checks budget and acquires the slot atomically.
         # Reserve a conservative full-call allowance before allowing another call.
         if os.getenv("VERCEL") and settings.durable_storage_backend() != "upstash_redis":
-            return False, "Upstash Redis is required for live Vercel calls"
+            return False, "Upstash Redis is required for live Vercel calls", None
         if settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN:
-            reserve = float(os.getenv("APEX_MAX_CALL_RESERVE_USD", "3.00"))
-            # Fail closed if a full-duration call cannot fit the configured budget reserve.
-            if reserve <= 0 or reserve > settings.MONTHLY_BUDGET_LIMIT_USD:
-                return False, "Invalid call budget reservation"
+            reserve, reserve_err = self._call_reserve_usd()
+            if reserve_err:
+                return False, reserve_err, None
+            accounting = {"call_id": call_id, "month": month_key, "reserve": reserve, "reconciled": False}
+            accounting_value = json.dumps(accounting)
+            state_payload = {"call": call_record, "transcripts": [], "accounting": accounting}
+            marker_ttl = str(settings.MAX_CALL_DURATION_SECONDS + 60)
+            acct_ttl = str(self.ACCOUNTING_TTL_SECONDS)
+            # KEYS: 1=active call lock, 2=current-month spend, 3=short marker, 4=durable accounting, 5=durable call state
             script = """
+            local lock = redis.call('GET', KEYS[1])
+            if lock == ARGV[1] then
+              if redis.call('EXISTS', KEYS[4]) == 1 or redis.call('EXISTS', KEYS[3]) == 1 then return 2 end
+              return 3
+            end
+            if lock then return 0 end
+            local state_raw = redis.call('GET', KEYS[5])
+            if state_raw then
+              local decoded, state = pcall(cjson.decode, state_raw)
+              if decoded and type(state) == 'table' and type(state['call']) == 'table' then
+                if state['call']['status'] == 'in-progress' then
+                  -- Authoritative accounting always wins over possibly stale call state.
+                  local acct_raw = redis.call('GET', KEYS[4])
+                  if acct_raw then
+                    local acct_ok, acct = pcall(cjson.decode, acct_raw)
+                    if not acct_ok or type(acct) ~= 'table' or acct['reconciled'] == true then return 5 end
+                    redis.call('SET', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[2]))
+                    redis.call('SET', KEYS[3], acct_raw, 'EX', tonumber(ARGV[3]))
+                    return 4
+                  end
+                  local state_acct = state['accounting']
+                  if type(state_acct) == 'table' and state_acct['reconciled'] ~= true then
+                    local state_json = cjson.encode(state_acct)
+                    local armed = redis.call('SET', KEYS[4], state_json, 'NX', 'EX', tonumber(ARGV[7]))
+                    local chosen = state_json
+                    if not armed then
+                      local racing = redis.call('GET', KEYS[4])
+                      if not racing then return 5 end
+                      local racing_ok, racing_acct = pcall(cjson.decode, racing)
+                      if not racing_ok or type(racing_acct) ~= 'table' or racing_acct['reconciled'] == true then return 5 end
+                      chosen = racing
+                    end
+                    redis.call('SET', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[2]))
+                    redis.call('SET', KEYS[3], chosen, 'EX', tonumber(ARGV[3]))
+                    return 4
+                  end
+                  return 5
+                end
+                return 5
+              end
+            end
+            if redis.call('EXISTS', KEYS[4]) == 1 then return 5 end
             local spent = tonumber(redis.call('GET', KEYS[2]) or '0')
-            if spent + tonumber(ARGV[3]) > tonumber(ARGV[4]) then return 0 end
-            if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
+            if spent + tonumber(ARGV[4]) > tonumber(ARGV[5]) then return 0 end
             redis.call('SET', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[2]))
-            redis.call('INCRBYFLOAT', KEYS[2], ARGV[3])
+            redis.call('INCRBYFLOAT', KEYS[2], ARGV[4])
+            redis.call('SET', KEYS[3], ARGV[6], 'EX', tonumber(ARGV[3]))
+            redis.call('SET', KEYS[4], ARGV[6], 'EX', tonumber(ARGV[7]))
             return 1
             """
             try:
-                ok = self._upstash_cmd(["EVAL", script, "2", "apex:active_call_lock",
-                                        f"apex:spend:{month_key}", call_id,
+                ok = self._upstash_cmd(["EVAL", script, "5", "apex:active_call_lock",
+                                        f"apex:spend:{month_key}", f"apex:reserve:{call_id}",
+                                        f"apex:acct:{call_id}", f"apex:call:{call_id}", call_id,
                                         str(settings.MAX_CALL_DURATION_SECONDS + 15),
-                                        str(reserve), str(settings.MONTHLY_BUDGET_LIMIT_USD)])
+                                        marker_ttl, str(reserve), str(settings.MONTHLY_BUDGET_LIMIT_USD),
+                                        accounting_value, acct_ttl])
             except RuntimeError:
-                return False, "Durable budget/lock store unavailable"
-            if ok != 1:
-                return False, "Concurrent call or budget limit reached"
+                return False, "Durable budget/lock store unavailable", None
+            if ok == 0:
+                return False, "Concurrent call or budget limit reached", None
+            if ok == 5:
+                # Known CallSid with an ended/unknown session must not be re-admitted as billable.
+                return False, "Call already completed; duplicate admission refused", "duplicate"
+            if ok == 2:
+                # Same call, already reserved: retry must not reserve twice.
+                if os.getenv("VERCEL"):
+                    try:
+                        self.ensure_durable_call_state(call_id, state_payload)
+                    except Exception:
+                        return False, "Durable call state unavailable", None
+                return True, None, "replay"
+            if ok == 3:
+                # Lock is ours but reservation accounting is missing. Recover only from
+                # durable state; never assume a month or amount.
+                if os.getenv("VERCEL"):
+                    try:
+                        state = self.load_durable_call_state(call_id) or {}
+                        recovered = state.get("accounting") if isinstance(state, dict) else None
+                        if not isinstance(recovered, dict) or not recovered.get("month") or recovered.get("reserve") is None:
+                            return False, "Reservation accounting unavailable", None
+                        recovered_value = json.dumps(recovered)
+                        self._upstash_cmd(["SET", f"apex:acct:{call_id}", recovered_value, "EX", acct_ttl, "NX"])
+                        self._upstash_cmd(["SET", f"apex:reserve:{call_id}", recovered_value, "EX", marker_ttl, "NX"])
+                        self.ensure_durable_call_state(call_id, state_payload)
+                    except Exception:
+                        return False, "Durable call state unavailable", None
+                return True, None, "replay"
+            if ok == 4:
+                # Lock was lost while the call remained active: reacquired without charging again.
+                return True, None, "replay"
+            # ok == 1: fresh reservation.
 
         if os.getenv("VERCEL"):
             try:
-                self.save_durable_call_state(call_id, {"call": call_record, "transcripts": []})
+                self.ensure_durable_call_state(call_id, state_payload)
             except Exception:
                 # Do not allow a call to proceed without shared state.
                 self.release_call_slot(call_id)
-                return False, "Durable call state unavailable"
-            return True, None
+                return False, "Durable call state unavailable", None
+            return True, None, "created"
 
         # 2. Local SQLite BEGIN IMMEDIATE atomic check + insert
         with self.get_connection() as conn:
@@ -304,7 +402,7 @@ class Database:
                 spend = float(cursor.fetchone()["total"])
                 if settings.durable_storage_backend() != "upstash_redis" and spend >= settings.MONTHLY_BUDGET_LIMIT_USD:
                     conn.rollback()
-                    return False, f"Monthly budget limit of ${settings.MONTHLY_BUDGET_LIMIT_USD:.2f} USD reached."
+                    return False, f"Monthly budget limit of ${settings.MONTHLY_BUDGET_LIMIT_USD:.2f} USD reached.", None
 
                 cursor.execute(
                     "SELECT COUNT(*) as cnt FROM calls WHERE status IN ('ringing', 'in-progress') AND id != ?",
@@ -313,7 +411,7 @@ class Database:
                 active_cnt = int(cursor.fetchone()["cnt"])
                 if settings.durable_storage_backend() != "upstash_redis" and active_cnt >= settings.MAX_CONCURRENT_CALLS:
                     conn.rollback()
-                    return False, f"Maximum concurrent call limit ({settings.MAX_CONCURRENT_CALLS}) reached."
+                    return False, f"Maximum concurrent call limit ({settings.MAX_CONCURRENT_CALLS}) reached.", None
 
                 cursor.execute("""
                 INSERT OR REPLACE INTO calls (
@@ -336,36 +434,97 @@ class Database:
                 conn.rollback()
                 if settings.durable_storage_backend() == "upstash_redis":
                     self.release_call_slot(call_id)
-                return False, str(e)
+                return False, str(e), None
 
         # Persist initial durable state
-        self.save_durable_call_state(call_id, {
-            "call": call_record,
-            "transcripts": []
-        })
-        return True, None
+        if settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN:
+            try:
+                self.ensure_durable_call_state(call_id, {
+                    "call": call_record,
+                    "transcripts": [],
+                    "accounting": {"call_id": call_id, "month": month_key, "reserve": 0.0, "reconciled": True},
+                })
+            except Exception:
+                self.release_call_slot(call_id)
+                return False, "Durable call state unavailable", None
+        return True, None, "created"
 
     def release_call_slot(self, call_id: str, cost_delta: float = 0.0):
-        """Release only the owning call's slot; refund unused reserved budget once."""
+        """Release the call's slot and reconcile the reservation exactly once.
+
+        cost_delta is the expected total incurred cost for the call (not an incremental delta).
+        Returns (ok, error, outcome) where outcome is "released", "already_released", or None.
+        Durable accounting is authoritative; a missing short marker is never treated as success.
+        """
         if settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN:
-            month_key = datetime.utcnow().strftime("%Y-%m")
-            reserve = float(os.getenv("APEX_MAX_CALL_RESERVE_USD", "3.00"))
-            # Fail closed if a full-duration call cannot fit the configured budget reserve.
-            if reserve <= 0 or reserve > settings.MONTHLY_BUDGET_LIMIT_USD:
-                return False, "Invalid call budget reservation"
+            try:
+                acct_raw = self._upstash_cmd(["GET", f"apex:acct:{call_id}"])
+            except RuntimeError:
+                return False, "Durable budget/lock store unavailable", None
+            if not acct_raw:
+                # Recover accounting only from durable call state. Never guess month/amount.
+                try:
+                    state = self.load_durable_call_state(call_id) or {}
+                except RuntimeError:
+                    return False, "Durable budget/lock store unavailable", None
+                recovered = state.get("accounting") if isinstance(state, dict) else None
+                if not isinstance(recovered, dict) or not recovered.get("month") or recovered.get("reserve") is None:
+                    return False, "Reservation accounting unavailable", None
+                try:
+                    self._upstash_cmd(["SET", f"apex:acct:{call_id}", json.dumps(recovered),
+                                       "EX", str(self.ACCOUNTING_TTL_SECONDS), "NX"])
+                    acct_raw = self._upstash_cmd(["GET", f"apex:acct:{call_id}"])
+                except RuntimeError:
+                    return False, "Durable budget/lock store unavailable", None
+                if not acct_raw:
+                    return False, "Reservation accounting unavailable", None
+            try:
+                accounting = json.loads(acct_raw)
+                if not isinstance(accounting, dict):
+                    raise ValueError
+                acct_month = str(accounting["month"])
+                acct_reserve = float(accounting["reserve"])
+            except (TypeError, ValueError, KeyError):
+                return False, "Reservation accounting corrupt", None
+            if acct_month.count("-") != 1 or len(acct_month) != 7:
+                return False, "Reservation accounting corrupt", None
             script = """
-            if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
-            redis.call('DEL', KEYS[1])
+            local raw = redis.call('GET', KEYS[3])
+            if not raw then return 0 end
+            local decoded, acct = pcall(cjson.decode, raw)
+            if not decoded or type(acct) ~= 'table' then return 3 end
+            if acct['reconciled'] == true then return 2 end
+            if redis.call('GET', KEYS[1]) == ARGV[1] then redis.call('DEL', KEYS[1]) end
             redis.call('INCRBYFLOAT', KEYS[2], ARGV[2])
+            acct['reconciled'] = true
+            acct['reconciled_at'] = ARGV[3]
+            redis.call('SET', KEYS[3], cjson.encode(acct), 'EX', tonumber(ARGV[4]))
+            redis.call('DEL', KEYS[4])
             return 1
             """
             try:
-                self._upstash_cmd(["EVAL", script, "2", "apex:active_call_lock",
-                                   f"apex:spend:{month_key}", call_id,
-                                   str(max(0.0, cost_delta) - reserve)])
+                result = self._upstash_cmd(["EVAL", script, "4", "apex:active_call_lock",
+                                            f"apex:spend:{acct_month}", f"apex:acct:{call_id}",
+                                            f"apex:reserve:{call_id}", call_id,
+                                            str(max(0.0, float(cost_delta)) - acct_reserve),
+                                            datetime.utcnow().isoformat(), str(self.ACCOUNTING_TTL_SECONDS)])
             except RuntimeError:
-                # Do not permit another call if durable accounting cannot be updated.
-                pass
+                return False, "Durable budget/lock store unavailable", None
+            if result == 1:
+                return True, None, "released"
+            if result == 2:
+                return True, None, "already_released"
+            if result == 3:
+                return False, "Reservation accounting corrupt", None
+            # Accounting disappeared between read and EVAL; do not guess success.
+            try:
+                still = self._upstash_cmd(["GET", f"apex:acct:{call_id}"])
+            except RuntimeError:
+                return False, "Durable budget/lock store unavailable", None
+            if not still:
+                return False, "Reservation accounting unavailable", None
+            return False, "Budget reconciliation not confirmed", None
+        return True, None, "released"
 
     def save_durable_call_state(self, call_id: str, state_payload: Dict[str, Any]):
         """Creates initial state; subsequent mutations use atomic Redis updates."""
@@ -405,6 +564,36 @@ class Database:
                                    json.dumps(updates or {}), json.dumps(transcript) if transcript else ""])
         if result != 1:
             raise RuntimeError("Call state missing; refusing unsafe local fallback")
+
+    def ensure_durable_call_state(self, call_id: str, state_payload: Dict[str, Any]) -> str:
+        """Guarantees durable state exists without discarding an in-progress call.
+
+        Returns "existing" when state is already present (retry of an ongoing call)
+        or "created" when state was (re)built. Raises RuntimeError when shared
+        state cannot be read/created, so admission can fail closed.
+        """
+        if settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN:
+            created = self._upstash_cmd(["SET", f"apex:call:{call_id}", json.dumps(state_payload), "EX", "86400", "NX"])
+            if created == "OK":
+                return "created"
+            existing = self._upstash_cmd(["GET", f"apex:call:{call_id}"])
+            if existing:
+                return "existing"
+            # Slot was reserved but state is missing; rebuild it rather than strand the call.
+            self._upstash_cmd(["SET", f"apex:call:{call_id}", json.dumps(state_payload), "EX", "86400"])
+            return "created"
+        if settings.TURSO_DATABASE_URL and settings.TURSO_AUTH_TOKEN:
+            res = self._turso_pipeline([
+                {"sql": "SELECT state_json FROM durable_calls WHERE call_id = ?",
+                 "args": [{"type": "text", "value": call_id}]}
+            ])
+            if res and len(res) > 0:
+                rows = res[0].get("response", {}).get("result", {}).get("rows", [])
+                if rows:
+                    return "existing"
+            self.save_durable_call_state(call_id, state_payload)
+            return "created"
+        return "existing"
 
     def load_durable_call_state(self, call_id: str) -> Optional[Dict[str, Any]]:
         """Loads durable call state across Vercel instances if local SQLite does not have it."""

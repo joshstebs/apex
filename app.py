@@ -28,6 +28,24 @@ db = Database(settings.DB_PATH)
 voice_engine = VoiceEngine()
 telephony = TelephonyGateway()
 
+
+def release_call_slot_safely(call_id: str, expected_total_cost: float) -> bool:
+    """Reconcile a call's reservation exactly once, without leaking secrets or failing telephony.
+
+    Failed reconciliation is logged with a truncated call identifier and leaves durable
+    accounting/lock data intact so a retried completion callback can reconcile later.
+    """
+    safe_call_id = (call_id or "")[-8:]
+    try:
+        ok, err, _outcome = db.release_call_slot(call_id, cost_delta=expected_total_cost)
+    except Exception as exc:  # accounting failures must not break call control responses
+        print(f"[Apex] budget reconciliation deferred for call ...{safe_call_id}: {type(exc).__name__}")
+        return False
+    if not ok:
+        print(f"[Apex] budget reconciliation deferred for call ...{safe_call_id}: {err}")
+        return False
+    return True
+
 def seed_default_assistants():
     existing = db.list_assistants()
     if not existing:
@@ -61,7 +79,11 @@ def handle_signalwire_inbound_or_connect(
     Acquires atomic concurrency & budget lock, stores greeting under an opaque short-lived clip_id,
     and returns SignalWire cXML.
     """
-    call_id = params.get("CallSid") or f"call_{uuid.uuid4().hex[:12]}"
+    call_id = (params.get("CallSid") or "").strip()
+    if not call_id:
+        if os.getenv("VERCEL"):
+            return telephony.build_signalwire_cxml_hangup("Invalid call identifier. Goodbye.")
+        call_id = f"call_{uuid.uuid4().hex[:12]}"
     from_number = params.get("From", "Unknown")
     # Only accept incoming calls for the number configured by the operator.
     # This prevents another DID in the same account from being unintentionally answered.
@@ -111,14 +133,24 @@ def handle_signalwire_inbound_or_connect(
         "started_at": datetime.utcnow().isoformat()
     }
 
-    # Atomic concurrency (1 call) and budget ($5.00) lock across simultaneous Vercel instances
-    acquired, err_msg = db.try_acquire_call_slot(call_record)
-    if not acquired:
+    # Atomic admission is the single source of truth for retries and concurrency.
+    try:
+        admitted, _err_msg, outcome = db.try_acquire_call_slot(call_record)
+    except RuntimeError:
+        admitted, outcome = False, None
+    if not admitted:
+        if outcome == "duplicate":
+            # A completed CallSid must never be re-admitted as a fresh billable call.
+            return telephony.build_signalwire_cxml_hangup(
+                "This call session has already ended. Goodbye."
+            )
         return telephony.build_signalwire_cxml_hangup(
             "Sorry, this line is currently busy or has reached its usage limit. Please try again later."
         )
 
-    db.add_transcript_message(call_id, "assistant", greeting, latency_ms=95)
+    replay = outcome == "replay"
+    if not replay:
+        db.add_transcript_message(call_id, "assistant", greeting, latency_ms=95)
     # Create short-lived opaque TTS clip ID (zero conversation text in URL)
     clip_id = None
     if voice_engine.elevenlabs_key and voice_engine.elevenlabs_key.strip():
@@ -165,21 +197,21 @@ def handle_signalwire_gather_turn(
         return telephony.build_signalwire_cxml_hangup("Unable to verify call duration. Goodbye.")
     if new_duration >= settings.MAX_CALL_DURATION_SECONDS:
         cost_info = VoiceEngine.calculate_call_cost(settings.MAX_CALL_DURATION_SECONDS, provider="signalwire")
-        prev_cost = float(call.get("cost_total", 0.0) or 0.0)
         db.update_call(call_id, {
             "status": "completed",
             "duration_seconds": settings.MAX_CALL_DURATION_SECONDS,
             "ended_at": datetime.utcnow().isoformat(),
             "cost_total": cost_info["cost_total"]
         })
-        db.release_call_slot(call_id, cost_delta=max(0.0, cost_info["cost_total"] - prev_cost))
+        # release_call_slot expects expected TOTAL incurred cost, not an incremental delta.
+        release_call_slot_safely(call_id, cost_info["cost_total"])
         return telephony.build_signalwire_cxml_hangup(
             f"We have reached our {settings.MAX_CALL_DURATION_SECONDS // 60} minute call time limit. Thank you and goodbye!"
         )
 
     if not user_input:
         db.update_call(call_id, {"status": "completed", "ended_at": datetime.utcnow().isoformat()})
-        db.release_call_slot(call_id, cost_delta=0.0)
+        release_call_slot_safely(call_id, 0.0)
         return telephony.build_signalwire_cxml_hangup("I didn't hear anything. Goodbye!")
 
     ast = db.get_assistant(call.get("assistant_id") or assistant_id)
@@ -234,7 +266,7 @@ def handle_signalwire_gather_turn(
 
     if any(p in user_input.lower() for p in ["goodbye", "bye", "that's all", "hang up"]):
         db.update_call(call_id, {"status": "completed", "ended_at": datetime.utcnow().isoformat()})
-        db.release_call_slot(call_id, cost_delta=cost_info["cost_total"])
+        release_call_slot_safely(call_id, cost_info["cost_total"])
         return telephony.build_signalwire_cxml_hangup(reply_text, clip_id=clip_id)
 
     return telephony.build_signalwire_cxml_gather(
@@ -476,8 +508,9 @@ try:
             "cost_tts": cost_info["cost_tts"],
             "cost_total": cost_info["cost_total"]
         })
-        db.release_call_slot(call_id, cost_delta=cost_info["cost_total"])
-        return {"success": True, "call_id": call_id, "cost_breakdown": cost_info}
+        reconciled = release_call_slot_safely(call_id, cost_info["cost_total"])
+        return {"success": True, "call_id": call_id, "cost_breakdown": cost_info,
+                "budget_reconciled": reconciled}
 
     @app.post("/api/simulate/turn")
     def simulate_conversation_turn(payload: SimulationTurnPayload, admin=Depends(require_admin)):
@@ -637,7 +670,8 @@ try:
                 "cost_tts": cost_info["cost_tts"],
                 "cost_total": cost_info["cost_total"]
             })
-            db.release_call_slot(call_id, cost_delta=cost_info["cost_total"])
+            reconciled = release_call_slot_safely(call_id, cost_info["cost_total"])
+            return {"status": "ok", "budget_reconciled": reconciled}
         return {"status": "ok"}
 
     @app.post("/api/maintenance/enforce-call-duration")

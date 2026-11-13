@@ -22,20 +22,58 @@ def cmd(c):
         redis[c[1]]=c[2];return 'OK'
     if op=='EVAL':
         script=c[1]
-        if 'local spent' in script:
-            lock,spend,call,ttl,reserve,budget=c[3:]
-            if lock in redis or float(redis.get(spend,0))+float(reserve)>float(budget):return 0
-            redis[lock]=call;redis[spend]=str(float(redis.get(spend,0))+float(reserve));return 1
-        if 'local raw' in script:
+        if 'local lock = redis.call' in script and 'KEYS[5]' in script:
+            lock,spend,marker,acct,state=c[3:8]
+            call,lock_ttl,marker_ttl,reserve,budget,acct_json,acct_ttl=c[8:]
+            if redis.get(lock)==call:
+                if acct in redis or marker in redis:return 2
+                return 3
+            if lock in redis:return 0
+            raw_state=redis.get(state)
+            if raw_state:
+                try: decoded=json.loads(raw_state)
+                except Exception: decoded=None
+                if isinstance(decoded,dict) and isinstance(decoded.get('call'),dict):
+                    if decoded['call'].get('status')=='in-progress':
+                        acct_raw=redis.get(acct)
+                        if acct_raw is not None:
+                            try: acct_obj=json.loads(acct_raw)
+                            except Exception: return 5
+                            if not isinstance(acct_obj,dict) or acct_obj.get('reconciled') is True: return 5
+                            redis[lock]=call;redis[marker]=acct_raw;return 4
+                        state_acct=decoded.get('accounting')
+                        if isinstance(state_acct,dict) and state_acct.get('reconciled') is not True:
+                            state_json=json.dumps(state_acct);chosen=state_json
+                            if acct not in redis: redis[acct]=state_json
+                            else:
+                                chosen=redis[acct]
+                                try: racing=json.loads(chosen)
+                                except Exception: return 5
+                                if not isinstance(racing,dict) or racing.get('reconciled') is True: return 5
+                            redis[lock]=call;redis[marker]=chosen;return 4
+                        return 5
+                    return 5
+            if acct in redis:return 5
+            if float(redis.get(spend,0))+float(reserve)>float(budget):return 0
+            redis[lock]=call;redis[spend]=str(float(redis.get(spend,0))+float(reserve));redis[acct]=acct_json;redis[marker]=acct_json;return 1
+        if "local raw = redis.call('GET', KEYS[1])" in script:
             key,updates,transcript=c[3:]
             if key not in redis:return 0
             state=json.loads(redis[key]);state['call'].update(json.loads(updates))
             if transcript:state['transcripts'].append(json.loads(transcript))
             redis[key]=json.dumps(state);return 1
-        if "redis.call('DEL'" in script:
-            lock,spend,call,delta=c[3:]
-            if redis.get(lock)!=call:return 0
-            del redis[lock];redis[spend]=str(float(redis.get(spend,0))+float(delta));return 1
+        if "local raw = redis.call('GET', KEYS[3])" in script:
+            lock,spend,acct,marker=c[3:7]
+            call,delta,now,acct_ttl=c[7:]
+            raw=redis.get(acct)
+            if not raw:return 0
+            try: accounting=json.loads(raw)
+            except Exception: return 3
+            if accounting.get('reconciled') is True:return 2
+            if redis.get(lock)==call:redis.pop(lock,None)
+            redis[spend]=str(float(redis.get(spend,0))+float(delta))
+            accounting['reconciled']=True;accounting['reconciled_at']=now
+            redis[acct]=json.dumps(accounting);redis.pop(marker,None);return 1
     raise AssertionError('Unmocked Redis operation '+str(c))
 db._upstash_cmd=cmd
 client=TestClient(app)
