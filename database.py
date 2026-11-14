@@ -7,9 +7,12 @@ Supports:
 """
 import sqlite3
 import json
+import math
 import time
 import secrets
 import os
+import re
+import base64
 import urllib.request
 import urllib.parse
 from datetime import datetime
@@ -19,9 +22,15 @@ from config import settings
 class Database:
     # Durable accounting outlives the short marker and 24h call-state TTL.
     ACCOUNTING_TTL_SECONDS = 604800
+    CALL_PAUSE_KEY = "apex:operations:paused"
+    ACTIVE_CALL_KEY = "apex:active_call_lock"
+    SCHEDULER_KEY = "apex:operations:scheduler_at"
 
     def __init__(self, db_path: str = None):
         self.db_path = db_path or settings.DB_PATH
+        self._recent_errors: List[Dict[str, str]] = []
+        self._local_tts_audio: Dict[str, bytes] = {}
+        self._webhook_times: List[float] = []
         if not os.getenv("VERCEL"):
             self._init_db()
 
@@ -77,9 +86,14 @@ class Database:
                 outcome_status TEXT,
                 extracted_data TEXT,
                 recording_url TEXT,
+                settlement_source TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """)
+            try:
+                cursor.execute("ALTER TABLE calls ADD COLUMN settlement_source TEXT")
+            except sqlite3.OperationalError:
+                pass
 
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS transcripts (
@@ -261,9 +275,91 @@ class Database:
         except (TypeError, ValueError):
             return None, "Invalid call budget reservation"
         # Fail closed if a full-duration call cannot fit the configured budget reserve.
-        if reserve <= 0 or reserve > settings.MONTHLY_BUDGET_LIMIT_USD:
+        budget = settings.MONTHLY_BUDGET_LIMIT_USD
+        if not math.isfinite(reserve) or not math.isfinite(budget) or not 0 < reserve <= budget:
             return None, "Invalid call budget reservation"
         return reserve, None
+
+    def note_ops_error(self, code: str) -> None:
+        """Record a short error code for the operations dashboard. Never store exception text."""
+        safe = code if re.fullmatch(r"[a-z0-9_]{1,64}", code or "") else "unspecified"
+        entry = {"at": datetime.utcnow().isoformat() + "Z", "code": safe}
+        self._recent_errors.append(entry)
+        del self._recent_errors[:-50]
+        if not (settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN):
+            return
+        try:
+            self._upstash_cmd(["LPUSH", "apex:ops:errors", json.dumps(entry)])
+            self._upstash_cmd(["LTRIM", "apex:ops:errors", "0", "49"])
+        except Exception:
+            return
+
+    def list_ops_errors(self) -> List[Dict[str, str]]:
+        if settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN:
+            try:
+                raw = self._upstash_cmd(["LRANGE", "apex:ops:errors", "0", "49"])
+            except Exception:
+                raw = None
+            if isinstance(raw, list):
+                errors = []
+                for item in raw:
+                    try:
+                        parsed = json.loads(item) if isinstance(item, str) else item
+                    except (TypeError, json.JSONDecodeError):
+                        continue
+                    if isinstance(parsed, dict) and re.fullmatch(r"[a-z0-9_]{1,64}", str(parsed.get("code", ""))):
+                        errors.append({"at": str(parsed.get("at", "")), "code": parsed["code"]})
+                return errors
+        return list(self._recent_errors)
+
+    def staging_request_allowed(self) -> bool:
+        """Count staging webhook attempts. Production never consults this limit."""
+        if not settings.STAGING:
+            return True
+        limit = settings.STAGING_WEBHOOK_RATE_LIMIT_PER_MINUTE
+        if settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN:
+            try:
+                count = int(self._upstash_cmd(["INCR", "apex:staging:webhook_rate"]))
+                if count == 1:
+                    self._upstash_cmd(["EXPIRE", "apex:staging:webhook_rate", "60"])
+                return count <= limit
+            except Exception:
+                self.note_ops_error("staging_rate_limit_unavailable")
+                return False
+        now = time.time()
+        self._webhook_times = [stamp for stamp in self._webhook_times if now - stamp < 60]
+        if len(self._webhook_times) >= limit:
+            return False
+        self._webhook_times.append(now)
+        return True
+
+    def cache_tts_audio(self, clip_id: str, audio: bytes) -> bool:
+        """Store synthesized audio so a carrier retry does not buy the clip again."""
+        if not clip_id or not audio:
+            return False
+        self._local_tts_audio[clip_id] = audio
+        if not (settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN):
+            return True
+        try:
+            encoded = base64.b64encode(audio).decode("ascii")
+            result = self._upstash_cmd(["SET", f"apex:tts_audio:{clip_id}", encoded, "EX", "120"])
+        except Exception:
+            return False
+        return result == "OK"
+
+    def read_cached_tts_audio(self, clip_id: str) -> Optional[bytes]:
+        cached = self._local_tts_audio.get(clip_id)
+        if cached:
+            return cached
+        if not (settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN):
+            return None
+        encoded = self._upstash_cmd(["GET", f"apex:tts_audio:{clip_id}"])
+        if not encoded or not isinstance(encoded, str):
+            return None
+        try:
+            return base64.b64decode(encoded)
+        except Exception:
+            return None
 
     def try_acquire_call_slot(self, call_record: Dict[str, Any]) -> Tuple[bool, Optional[str], Optional[str]]:
         """
@@ -273,6 +369,8 @@ class Database:
         "duplicate" when a known completed CallSid must not be re-admitted as billable.
         """
         call_id = call_record["id"]
+        if settings.STAGING or settings.MONTHLY_BUDGET_LIMIT_USD <= 0:
+            return False, "Call admission blocked by staging or budget cap", None
         month_key = datetime.utcnow().strftime("%Y-%m")
 
         state_payload = {"call": call_record, "transcripts": []}
@@ -289,11 +387,33 @@ class Database:
             state_payload = {"call": call_record, "transcripts": [], "accounting": accounting}
             marker_ttl = str(settings.MAX_CALL_DURATION_SECONDS + 60)
             acct_ttl = str(self.ACCOUNTING_TTL_SECONDS)
-            # KEYS: 1=active call lock, 2=current-month spend, 3=short marker, 4=durable accounting, 5=durable call state
+            hosted = bool(os.getenv("VERCEL"))
+            # Hosted calls keep their slot until carrier confirmation. A legacy lease can
+            # be made durable on replay or by the scheduler before it expires.
+            # KEYS: slot, spend, short marker, accounting, call state, pause, scheduler
             script = """
+            if redis.call('EXISTS', KEYS[6]) == 1 then return 6 end
             local lock = redis.call('GET', KEYS[1])
+            local hosted = ARGV[2] == '0'
+            if hosted and redis.call('EXISTS', KEYS[7]) == 0 then return 7 end
+            local function hold_slot()
+              if hosted then
+                redis.call('SET', KEYS[1], ARGV[1])
+              else
+                redis.call('SET', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[2]))
+              end
+            end
             if lock == ARGV[1] then
-              if redis.call('EXISTS', KEYS[4]) == 1 or redis.call('EXISTS', KEYS[3]) == 1 then return 2 end
+              local tracked = redis.call('GET', KEYS[5])
+              if tracked then
+                local valid, saved = pcall(cjson.decode, tracked)
+                if not valid or type(saved) ~= 'table' or type(saved.call) ~= 'table'
+                   or saved.call.status ~= 'in-progress' then return 5 end
+              end
+              if redis.call('EXISTS', KEYS[4]) == 1 or redis.call('EXISTS', KEYS[3]) == 1 then
+                if hosted then redis.call('PERSIST', KEYS[1]) end
+                return 2
+              end
               return 3
             end
             if lock then return 0 end
@@ -307,7 +427,7 @@ class Database:
                   if acct_raw then
                     local acct_ok, acct = pcall(cjson.decode, acct_raw)
                     if not acct_ok or type(acct) ~= 'table' or acct['reconciled'] == true then return 5 end
-                    redis.call('SET', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[2]))
+                    hold_slot()
                     redis.call('SET', KEYS[3], acct_raw, 'EX', tonumber(ARGV[3]))
                     return 4
                   end
@@ -323,7 +443,7 @@ class Database:
                       if not racing_ok or type(racing_acct) ~= 'table' or racing_acct['reconciled'] == true then return 5 end
                       chosen = racing
                     end
-                    redis.call('SET', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[2]))
+                    hold_slot()
                     redis.call('SET', KEYS[3], chosen, 'EX', tonumber(ARGV[3]))
                     return 4
                   end
@@ -334,22 +454,26 @@ class Database:
             end
             if redis.call('EXISTS', KEYS[4]) == 1 then return 5 end
             local spent = tonumber(redis.call('GET', KEYS[2]) or '0')
-            if spent + tonumber(ARGV[4]) > tonumber(ARGV[5]) then return 0 end
-            redis.call('SET', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[2]))
+            if not spent or spent < 0 or spent + tonumber(ARGV[4]) > tonumber(ARGV[5]) then return 0 end
             redis.call('INCRBYFLOAT', KEYS[2], ARGV[4])
+            hold_slot()
             redis.call('SET', KEYS[3], ARGV[6], 'EX', tonumber(ARGV[3]))
             redis.call('SET', KEYS[4], ARGV[6], 'EX', tonumber(ARGV[7]))
             return 1
             """
             try:
-                ok = self._upstash_cmd(["EVAL", script, "5", "apex:active_call_lock",
+                ok = self._upstash_cmd(["EVAL", script, "7", self.ACTIVE_CALL_KEY,
                                         f"apex:spend:{month_key}", f"apex:reserve:{call_id}",
-                                        f"apex:acct:{call_id}", f"apex:call:{call_id}", call_id,
-                                        str(settings.MAX_CALL_DURATION_SECONDS + 15),
+                                        f"apex:acct:{call_id}", f"apex:call:{call_id}", self.CALL_PAUSE_KEY, self.SCHEDULER_KEY,
+                                        call_id, "0" if hosted else str(settings.MAX_CALL_DURATION_SECONDS + 15),
                                         marker_ttl, str(reserve), str(settings.MONTHLY_BUDGET_LIMIT_USD),
                                         accounting_value, acct_ttl])
             except RuntimeError:
                 return False, "Durable budget/lock store unavailable", None
+            if ok == 7:
+                return False, "Call deadline scheduler unavailable", None
+            if ok == 6:
+                return False, "Call handling is paused", "paused"
             if ok == 0:
                 return False, "Concurrent call or budget limit reached", None
             if ok == 5:
@@ -382,7 +506,8 @@ class Database:
             if ok == 4:
                 # Lock was lost while the call remained active: reacquired without charging again.
                 return True, None, "replay"
-            # ok == 1: fresh reservation.
+            if ok != 1:
+                return False, "Durable admission could not be verified", None
 
         if os.getenv("VERCEL"):
             try:
@@ -449,18 +574,73 @@ class Database:
                 return False, "Durable call state unavailable", None
         return True, None, "created"
 
-    def release_call_slot(self, call_id: str, cost_delta: float = 0.0):
-        """Release the call's slot and reconcile the reservation exactly once.
+    def probe_redis(self) -> bool:
+        """Round-trip a nonce. The caller reports only the boolean, never the nonce."""
+        if not (settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN):
+            return False
+        nonce = secrets.token_hex(8)
+        key = "apex:staging:probe"
+        try:
+            self._upstash_cmd(["SET", key, nonce, "EX", "30"])
+            seen = self._upstash_cmd(["GET", key])
+            self._upstash_cmd(["DEL", key])
+        except Exception:
+            return False
+        return seen == nonce
 
-        cost_delta is the expected total incurred cost for the call (not an incremental delta).
-        Returns (ok, error, outcome) where outcome is "released", "already_released", or None.
-        Durable accounting is authoritative; a missing short marker is never treated as success.
-        """
+    def get_reservation(self, call_id: str, ledger: str = "live") -> Optional[Dict[str, Any]]:
+        key = f"apex:acct:{call_id}" if ledger == "live" else f"apex:drill:acct:{call_id}"
+        if not (settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN):
+            return None
+        raw = self._upstash_cmd(["GET", key])
+        if not raw:
+            return None
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    def list_stale_calls(self) -> List[Dict[str, Any]]:
         if settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN:
+            ids = self._upstash_cmd(["ZREVRANGE", "apex:stale_calls", "0", "49"])
+            if not isinstance(ids, list):
+                raise RuntimeError("Stale call index unavailable")
+            calls = []
+            for call_id in ids:
+                if not isinstance(call_id, str):
+                    continue
+                call = self.get_call(call_id)
+                if call and call.get("status") == "stale_unsettled":
+                    calls.append(call)
+            return calls
+        if os.getenv("VERCEL"):
+            return []
+        return [call for call in self.list_calls(50) if call.get("status") == "stale_unsettled"]
+
+    def release_call_slot(self, call_id: str, cost_delta: float = 0.0, source: str = "carrier", ledger: str = "live"):
+        """Reconcile one call's reservation.
+
+        cost_delta is the expected total incurred cost (not an increment).
+        The first settlement replaces the reserve with that total. A later carrier
+        callback may replace a stale or manual estimate with the carrier total.
+        A second carrier settlement does not move the ledger.
+        Returns (ok, error, outcome): released, adjusted, already_released, or None.
+        """
+        if source not in ("carrier", "stale_estimate", "manual"):
+            return False, "Invalid settlement source", None
+        if ledger not in ("live", "drill"):
+            return False, "Invalid settlement ledger", None
+        if ledger == "drill" and not settings.STAGING:
+            return False, "Drill ledger is staging-only", None
+        if settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN:
+            acct_key = f"apex:acct:{call_id}" if ledger == "live" else f"apex:drill:acct:{call_id}"
             try:
-                acct_raw = self._upstash_cmd(["GET", f"apex:acct:{call_id}"])
+                acct_raw = self._upstash_cmd(["GET", acct_key])
             except RuntimeError:
                 return False, "Durable budget/lock store unavailable", None
+            if not acct_raw and ledger == "drill":
+                return False, "Reservation accounting unavailable", None
             if not acct_raw:
                 # Recover accounting only from durable call state. Never guess month/amount.
                 try:
@@ -486,44 +666,78 @@ class Database:
                 acct_reserve = float(accounting["reserve"])
             except (TypeError, ValueError, KeyError):
                 return False, "Reservation accounting corrupt", None
-            if acct_month.count("-") != 1 or len(acct_month) != 7:
+            if (acct_month.count("-") != 1 or len(acct_month) != 7
+                    or not math.isfinite(acct_reserve) or acct_reserve < 0
+                    or not math.isfinite(cost_delta) or cost_delta < 0):
                 return False, "Reservation accounting corrupt", None
             script = """
             local raw = redis.call('GET', KEYS[3])
             if not raw then return 0 end
             local decoded, acct = pcall(cjson.decode, raw)
             if not decoded or type(acct) ~= 'table' then return 3 end
-            if acct['reconciled'] == true then return 2 end
+            local source = ARGV[5]
+            local reserve = tonumber(acct['reserve']) or 0
+            local new_cost = tonumber(ARGV[6])
+            if not new_cost then new_cost = reserve + (tonumber(ARGV[2]) or 0) end
+            if new_cost < 0 then return 3 end
+            local function remember(kind)
+              acct['reconciled'] = true
+              acct['reconciled_at'] = ARGV[3]
+              acct['settlement_source'] = kind
+              acct['settled_cost'] = new_cost
+              redis.call('SET', KEYS[3], cjson.encode(acct), 'EX', tonumber(ARGV[4]))
+              redis.call('SET', 'apex:settle:' .. ARGV[1], kind, 'EX', tonumber(ARGV[4]))
+            end
+            if acct['reconciled'] == true then
+              local previous = acct['settlement_source'] or 'carrier'
+              if source == 'carrier' and (previous == 'stale_estimate' or previous == 'manual') then
+                local settled = tonumber(acct['settled_cost'])
+                if not settled then return 3 end
+                redis.call('INCRBYFLOAT', KEYS[2], tostring(new_cost - settled))
+                remember('carrier')
+                return 4
+              end
+              return 2
+            end
+            redis.call('INCRBYFLOAT', KEYS[2], tostring(new_cost - reserve))
             if redis.call('GET', KEYS[1]) == ARGV[1] then redis.call('DEL', KEYS[1]) end
-            redis.call('INCRBYFLOAT', KEYS[2], ARGV[2])
-            acct['reconciled'] = true
-            acct['reconciled_at'] = ARGV[3]
-            redis.call('SET', KEYS[3], cjson.encode(acct), 'EX', tonumber(ARGV[4]))
+            remember(source)
             redis.call('DEL', KEYS[4])
             return 1
             """
+            new_cost = max(0.0, float(cost_delta))
+            if ledger == "live":
+                keys = [self.ACTIVE_CALL_KEY, f"apex:spend:{acct_month}", f"apex:acct:{call_id}", f"apex:reserve:{call_id}"]
+            else:
+                keys = [
+                    f"apex:drill:lock:{call_id}", f"apex:drill:spend:{call_id}",
+                    f"apex:drill:acct:{call_id}", f"apex:drill:reserve:{call_id}",
+                ]
             try:
-                result = self._upstash_cmd(["EVAL", script, "4", "apex:active_call_lock",
-                                            f"apex:spend:{acct_month}", f"apex:acct:{call_id}",
-                                            f"apex:reserve:{call_id}", call_id,
-                                            str(max(0.0, float(cost_delta)) - acct_reserve),
-                                            datetime.utcnow().isoformat(), str(self.ACCOUNTING_TTL_SECONDS)])
+                result = self._upstash_cmd(["EVAL", script, "4", *keys, call_id,
+                                            str(new_cost - acct_reserve),
+                                            datetime.utcnow().isoformat(), str(self.ACCOUNTING_TTL_SECONDS),
+                                            source, str(new_cost)])
             except RuntimeError:
                 return False, "Durable budget/lock store unavailable", None
             if result == 1:
                 return True, None, "released"
             if result == 2:
                 return True, None, "already_released"
+            if result == 4:
+                return True, None, "adjusted"
             if result == 3:
                 return False, "Reservation accounting corrupt", None
             # Accounting disappeared between read and EVAL; do not guess success.
             try:
-                still = self._upstash_cmd(["GET", f"apex:acct:{call_id}"])
+                still = self._upstash_cmd(["GET", acct_key])
             except RuntimeError:
                 return False, "Durable budget/lock store unavailable", None
             if not still:
                 return False, "Reservation accounting unavailable", None
             return False, "Budget reconciliation not confirmed", None
+        if ledger == "drill":
+            return False, "Redis is not configured", None
         return True, None, "released"
 
     def save_durable_call_state(self, call_id: str, state_payload: Dict[str, Any]):
@@ -544,13 +758,17 @@ class Database:
                 }
             ])
 
-    def _atomic_update_state(self, call_id: str, updates=None, transcript=None):
+    def mark_call_ending(self, call_id: str) -> None:
+        self._atomic_update_state(call_id, updates={"status": "ending"}, only_if_active=True)
+
+    def _atomic_update_state(self, call_id: str, updates=None, transcript=None, only_if_active=False):
         if not (settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN):
             raise RuntimeError("Shared Redis is required for production call state")
         script = """
         local raw = redis.call('GET', KEYS[1])
         if not raw then return 0 end
         local state = cjson.decode(raw)
+        if ARGV[5] == 'active' and state.call.status ~= 'in-progress' then return 2 end
         local updates = cjson.decode(ARGV[1])
         for k,v in pairs(updates) do state.call[k] = v end
         if ARGV[2] ~= '' then
@@ -558,11 +776,30 @@ class Database:
           table.insert(state.transcripts, msg)
         end
         redis.call('SET', KEYS[1], cjson.encode(state), 'EX', 86400)
+        local noted_at = tonumber(ARGV[4])
+        if noted_at and ARGV[3] ~= '' then
+          redis.call('ZADD', 'apex:recent_calls', noted_at, ARGV[3])
+          redis.call('ZREMRANGEBYRANK', 'apex:recent_calls', 0, -51)
+          redis.call('EXPIRE', 'apex:recent_calls', 86400)
+        end
+        local message = updates.extracted_data and updates.extracted_data.save_receptionist_message
+        if type(message) == 'table' and next(message) and noted_at then
+          redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', noted_at - 86400)
+          redis.call('ZADD', KEYS[2], noted_at, ARGV[3])
+          redis.call('EXPIRE', KEYS[2], 86400)
+        end
         return 1
         """
-        result = self._upstash_cmd(["EVAL", script, "1", f"apex:call:{call_id}",
-                                   json.dumps(updates or {}), json.dumps(transcript) if transcript else ""])
-        if result != 1:
+        # ARGV: updates, transcript, call id, unix time, optional "active".
+        # Recent-call indexing uses a fixed key because this command shape is
+        # shared with the receptionist message index (two KEYS).
+        command = ["EVAL", script, "2", f"apex:call:{call_id}", "apex:receptionist_messages",
+                   json.dumps(updates or {}), json.dumps(transcript) if transcript else "",
+                   call_id, str(int(time.time()))]
+        if only_if_active:
+            command.append("active")
+        result = self._upstash_cmd(command)
+        if result != 1 and not (only_if_active and result == 2):
             raise RuntimeError("Call state missing; refusing unsafe local fallback")
 
     def ensure_durable_call_state(self, call_id: str, state_payload: Dict[str, Any]) -> str:
@@ -723,7 +960,10 @@ class Database:
 
     def update_call(self, call_id: str, updates: Dict[str, Any]):
         if os.getenv("VERCEL"):
-            allowed = {"status", "ended_at", "duration_seconds", "cost_telephony", "cost_llm", "cost_tts", "cost_total", "extracted_data", "outcome_status"}
+            allowed = {
+                "status", "ended_at", "duration_seconds", "cost_telephony", "cost_llm",
+                "cost_tts", "cost_total", "extracted_data", "outcome_status", "settlement_source",
+            }
             if set(updates) - allowed:
                 raise ValueError("Invalid call update field")
             self._atomic_update_state(call_id, updates=updates)
@@ -753,6 +993,63 @@ class Database:
             for key in ("dynamic_vars_applied", "extracted_data"):
                 data[key] = json.loads(data[key]) if data.get(key) else {}
             return data
+
+    def list_recent_calls(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """Recent calls for the operations dashboard. Phone numbers stay out of this index."""
+        limit = max(1, min(int(limit), 50))
+        if settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN:
+            ids = self._upstash_cmd(["ZREVRANGE", "apex:recent_calls", "0", str(limit - 1)])
+            if not isinstance(ids, list):
+                raise RuntimeError("Recent call index unavailable")
+            calls = []
+            for call_id in ids:
+                if not isinstance(call_id, str):
+                    continue
+                call = self.get_call(call_id)
+                if call:
+                    calls.append(call)
+            return calls
+        if os.getenv("VERCEL"):
+            raise RuntimeError("Recent call index requires Redis")
+        return self.list_calls(limit)
+
+    def list_receptionist_messages(self) -> List[Dict[str, Any]]:
+        """Return the newest 50 captured receptionist messages from shared call state."""
+        if not (settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN):
+            if os.getenv("VERCEL"):
+                raise RuntimeError("Shared Redis message storage is required")
+            messages = []
+            for call in self.list_calls(50):
+                message = (call.get("extracted_data") or {}).get("save_receptionist_message")
+                if isinstance(message, dict) and message:
+                    messages.append({
+                        "call_id": call.get("id"),
+                        "started_at": call.get("started_at"),
+                        "message": message,
+                    })
+            return messages
+        script = """
+        local ids = redis.call('ZREVRANGEBYSCORE', KEYS[1], '+inf', ARGV[1], 'LIMIT', 0, 50)
+        local messages = {}
+        for _, id in ipairs(ids) do
+          local raw = redis.call('GET', 'apex:call:' .. id)
+          if raw then
+            local call = cjson.decode(raw).call
+            local message = call.extracted_data and call.extracted_data.save_receptionist_message
+            if type(message) == 'table' and next(message) then
+              table.insert(messages, cjson.encode({
+                call_id = id, started_at = call.started_at, message = message
+              }))
+            end
+          end
+        end
+        return messages
+        """
+        cutoff = str(int(time.time()) - 86400)
+        messages = self._upstash_cmd(["EVAL", script, "1", "apex:receptionist_messages", cutoff])
+        if not isinstance(messages, list):
+            raise RuntimeError("Message storage returned an invalid response")
+        return [json.loads(message) for message in messages]
 
     def list_calls(self, limit: int = 50) -> List[Dict[str, Any]]:
         if os.getenv("VERCEL"):
@@ -810,6 +1107,10 @@ class Database:
             spend_raw = self._upstash_cmd(["GET", f"apex:spend:{month_key}"])
             if spend_raw is not None:
                 return round(float(spend_raw), 4)
+        # Vercel skips local schema creation and the project disk is read-only.
+        # Do not open SQLite there; the caller shows an empty spend instead of HTTP 500.
+        if os.getenv("VERCEL"):
+            raise RuntimeError("Shared Redis is not configured")
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT COALESCE(SUM(cost_total), 0.0) as total FROM calls")

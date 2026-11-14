@@ -63,14 +63,15 @@ an existing business number here before this verification.
 - Gather follow-up (POST, generated automatically by cXML): `/webhooks/signalwire/gather`
 - Status callback (POST): `/webhooks/signalwire/status`
 - Protected manual hangup: `POST /api/calls/{call_id}/terminate` (bearer admin token)
-- Optional duration watchdog: `POST /api/maintenance/enforce-call-duration`
+- Required Vercel inbound duration watchdog: `POST /api/maintenance/enforce-call-duration`
   (bearer `CRON_SECRET`, requires an **external scheduler at least once a minute**).
 
-A successful hangup request is not the same as a confirmed hangup. The carrier
-status callback must be checked and invoices reconciled. An external 60-second
-watchdog is **not** an exact 20-minute cutoff; with a failed callback or scheduler,
-the call can exceed 20 minutes. Vercel Hobby cron cannot run every minute.
-Do not activate live routing until carrier-enforced duration and usage tests pass.
+The watchdog writes a three-minute heartbeat after a successful check. New Vercel
+calls require the heartbeat and a valid budget reservation. Once admitted, a call
+owns the slot until a signed terminal callback settles its reservation. A missing
+callback holds the slot closed. The one-minute scheduler cadence and upstream
+latency affect when an overdue hangup request is sent. Verify the carrier's own
+duration and spending controls using the test number before enabling business routing.
 
 
 ## Purchased SignalWire test number (October 29, 2026)
@@ -116,3 +117,49 @@ The project uses Vercel's native FastAPI detection of root `app.py`.
 Do not add a catch-all rewrite to `/api/index`, which causes FastAPI to receive
 an incorrect path and return HTTP 404 for the main application. The standalone
 `api/index.py` is retained as a legacy compatibility entrypoint only.
+
+### Command Center pause control
+
+Set a dedicated `APEX_OPERATIONS_TOKEN` before staging the operations endpoints. The token
+must be at least 32 characters and differ from `APEX_ADMIN_TOKEN`. Where Vercel and Upstash
+are configured, `GET /api/operations` returns a Redis admission estimate and scheduler heartbeat.
+`POST /api/operations/pause` atomically sets `apex:operations:paused` and reads the active-call
+slot. It then requests carrier termination when a slot is occupied. Carrier acceptance is
+reported separately, and signed status callbacks still reconcile costs. A provider request
+already dispatched can run to completion.
+
+To restore service, first verify the carrier has ended any active call and resolve the incident.
+Then remove only the `apex:operations:paused` key in the correct Upstash database. The application
+still requires its normal inbound configuration and budget eligibility. Use the provider consoles
+for actual billing and provider-side caps. The scheduled enforcer heartbeat expires after three
+minutes and indicates an authenticated check-in.
+
+
+### Operations dashboard
+
+`GET /` and `GET /operations` show service status, estimated spend versus the cap, the live call, recent calls, receptionist messages, and error codes after the administrator token is entered. The token stays in tab memory. `GET /api/dashboard` is the same snapshot and requires `Authorization: Bearer <APEX_ADMIN_TOKEN>`. Responses omit secrets and full recording audio. Audio recording is not enabled.
+
+Spoken replies use a cached ElevenLabs clip only after synthesis succeeds. If clip storage or synthesis fails, the cXML uses SignalWire `<Say>`. A call that ends without a model tool call stores the caller's transcript as a voicemail message.
+
+### Staging that cannot place calls
+
+Set `APEX_ENVIRONMENT=staging` on a Vercel preview and a free Redis database (Upstash free tier, or loopback Redis for tests). Staging forces a **$0** monthly cap in code, selects the mock telephony provider, refuses inbound admission, rate-limits webhooks, and does not open a carrier connection. `MONTHLY_BUDGET_LIMIT_USD` and `APEX_TELEPHONY_PROVIDER` cannot override those locks. Outbound PSTN stays disabled. Do not point `+12267732234` or any customer number at this deployment.
+
+`docs/RELEASE.md` lists the environment variable names, Redis keys, and the rollback procedure.
+
+To exercise a staging deployment without a carrier:
+
+```sh
+python3 scripts/staging_exercise.py --base-url https://<preview-host>
+```
+
+The admin token is read from `APEX_ADMIN_TOKEN` or `--token-file` and is not printed. The route is `POST /api/staging/exercise`. It returns 404 unless `APEX_ENVIRONMENT=staging`.
+
+The carrier-backed checks below are for a later, separate production rehearsal. They are not part of staging and they are not authorized by this branch:
+
+1. Keep `RECEPTIONIST_ENABLED=false` until a human has verified provider accounts, signatures, and spend caps.
+2. Run the enforcer every minute only on a host that is allowed to control a real call. Send a POST to `/api/maintenance/enforce-call-duration` with `Authorization: Bearer <CRON_SECRET>`.
+3. A hosted call keeps its Redis reservation until the signed terminal callback. Duplicate callbacks must not charge the estimate twice. A missing callback holds the slot.
+4. Before rolling back to a build whose call lock expires, pause inbound handling and confirm `apex:active_call_lock` is empty.
+
+Run `python -m compileall -q .` and the `test_*.py` scripts locally. Lifecycle and lock tests start loopback Redis and stub carrier termination.

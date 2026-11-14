@@ -13,6 +13,7 @@ settings.UPSTASH_REDIS_REST_URL = 'https://mock.invalid'
 settings.UPSTASH_REDIS_REST_TOKEN = 'test-only'
 settings.SIGNALWIRE_SIGNING_KEY = 'test-signature-key'
 settings.ENFORCE_WEBHOOK_SIGNATURE = True
+settings.CRON_SECRET = 'fixture-scheduler'
 settings.RECEPTIONIST_ENABLED = True
 settings.ELEVENLABS_API_KEY = 'test-only'
 settings.HUGGINGFACE_API_KEY = 'test-only'
@@ -20,11 +21,13 @@ settings.PUBLIC_URL = 'https://example.vercel.app'
 settings.REQUIRE_MATCHING_INBOUND_NUMBER = True
 settings.SIGNALWIRE_PHONE_NUMBER = '+12267732234'
 
-redis = {}
+redis = {db.SCHEDULER_KEY: "1"}
 eval_log = []
 
 def cmd(c):
     op = c[0].upper()
+    if op == 'EXISTS':
+        return int(c[1] in redis)
     if op == 'GET':
         return redis.get(c[1])
     if op == 'SET':
@@ -39,8 +42,12 @@ def cmd(c):
         eval_log.append(script[:60])
         # Admission: lock + spend + marker + durable accounting + durable state
         if 'local lock = redis.call' in script and 'KEYS[5]' in script:
-            lock, spend, marker, acct, state = c[3:8]
-            call, lock_ttl, marker_ttl, reserve, budget, acct_json, acct_ttl = c[8:]
+            lock, spend, marker, acct, state, pause, scheduler = c[3:10]
+            call, lock_ttl, marker_ttl, reserve, budget, acct_json, acct_ttl = c[10:]
+            if pause in redis:
+                return 6
+            if lock_ttl == "0" and scheduler not in redis:
+                return 7
             if redis.get(lock) == call:
                 if acct in redis or marker in redis:
                     return 2
@@ -96,7 +103,7 @@ def cmd(c):
             return 1
         # Atomic state update
         if "local raw = redis.call('GET', KEYS[1])" in script:
-            key, updates, transcript = c[3:]
+            key, _, updates, transcript, _, _ = c[3:]
             if key not in redis:
                 return 0
             state = json.loads(redis[key])
@@ -107,8 +114,13 @@ def cmd(c):
             return 1
         # Idempotent release / budget reconciliation (durable accounting is authoritative)
         if "local raw = redis.call('GET', KEYS[3])" in script:
-            lock, spend, acct, marker = c[3:7]
-            call, delta, now, acct_ttl = c[7:]
+            numkeys = int(c[2])
+            keys = c[3:3 + numkeys]
+            rest = c[3 + numkeys:]
+            lock, spend, acct, marker = keys[:4]
+            call, delta, now, acct_ttl = rest[:4]
+            source = rest[4] if len(rest) > 4 else "carrier"
+            new_cost = float(rest[5]) if len(rest) > 5 else None
             raw = redis.get(acct)
             if not raw:
                 return 0
@@ -117,12 +129,23 @@ def cmd(c):
             except Exception:
                 return 3
             if accounting.get('reconciled') is True:
+                previous = accounting.get('settlement_source') or 'carrier'
+                if source == 'carrier' and previous in ('stale_estimate', 'manual') and new_cost is not None:
+                    settled = float(accounting.get('settled_cost') or 0)
+                    redis[spend] = str(float(redis.get(spend, 0)) + (new_cost - settled))
+                    accounting['settled_cost'] = new_cost
+                    accounting['settlement_source'] = 'carrier'
+                    redis[acct] = json.dumps(accounting)
+                    return 4
                 return 2
             if redis.get(lock) == call:
                 redis.pop(lock, None)
             redis[spend] = str(float(redis.get(spend, 0)) + float(delta))
             accounting['reconciled'] = True
             accounting['reconciled_at'] = now
+            accounting['settlement_source'] = source
+            if new_cost is not None:
+                accounting['settled_cost'] = new_cost
             redis[acct] = json.dumps(accounting)
             redis.pop(marker, None)
             return 1
@@ -138,6 +161,7 @@ client = TestClient(app)
 
 def reset_state():
     redis.clear()
+    redis[db.SCHEDULER_KEY] = "1"
     eval_log.clear()
 
 
