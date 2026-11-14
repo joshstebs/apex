@@ -9,6 +9,8 @@ ApexVoice AI: Vercel-Ready Autonomous Telephony Platform
 - Secret-safe /api/health and /api/settings endpoints
 """
 import os
+import sqlite3
+import re
 import glob
 import json
 import uuid
@@ -69,6 +71,28 @@ def reconstruct_public_webhook_url(request_url_str: str, headers: Dict[str, str]
         parsed = urllib.parse.urlsplit(request_url_str)
         return urllib.parse.urlunsplit((proto.split(",")[0].strip(), host.split(",")[0].strip(), parsed.path, parsed.query, ""))
     return request_url_str
+
+def build_conversation_history(transcripts: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    roles = {"assistant": "assistant", "human": "user", "user": "user"}
+    conversation = [
+        {"role": roles[entry["speaker"]], "content": entry["message"]}
+        for entry in transcripts
+        if entry["speaker"] in roles
+    ]
+    return conversation[-16:]
+
+
+def create_voice_clip(spoken_text: str, voice_id: Optional[str]) -> Optional[str]:
+    if not (voice_engine.elevenlabs_key or "").strip():
+        return None
+    try:
+        return db.create_tts_clip(
+            spoken_text, voice_id=voice_id or settings.ELEVENLABS_DEFAULT_VOICE_ID
+        )
+    except (RuntimeError, sqlite3.Error):
+        print("[Apex] TTS clip storage unavailable; falling back to carrier speech")
+        return None
+
 
 def handle_signalwire_inbound_or_connect(
     params: Dict[str, str],
@@ -151,10 +175,7 @@ def handle_signalwire_inbound_or_connect(
     replay = outcome == "replay"
     if not replay:
         db.add_transcript_message(call_id, "assistant", greeting, latency_ms=95)
-    # Create short-lived opaque TTS clip ID (zero conversation text in URL)
-    clip_id = None
-    if voice_engine.elevenlabs_key and voice_engine.elevenlabs_key.strip():
-        clip_id = db.create_tts_clip(greeting, voice_id=ast.get("voice_id") or settings.ELEVENLABS_DEFAULT_VOICE_ID)
+    clip_id = create_voice_clip(greeting, ast.get("voice_id"))
 
     return telephony.build_signalwire_cxml_gather(
         call_id=call_id,
@@ -216,19 +237,16 @@ def handle_signalwire_gather_turn(
 
     ast = db.get_assistant(call.get("assistant_id") or assistant_id)
     if not ast:
-        ast = db.list_assistants()[0]
+        return telephony.build_signalwire_cxml_hangup(
+            "The receptionist is temporarily unavailable. Please contact the business directly."
+        )
 
     # Redis state is authoritative across Vercel instances.
+    conv_history = build_conversation_history(db.get_call_transcripts(call_id))
     db.add_transcript_message(call_id, "human", user_input)
 
-    dynamic_vars = call.get("dynamic_vars_applied", {"user_name": "Josh Stebs"})
+    dynamic_vars = {"business_name": settings.RECEPTIONIST_BUSINESS_NAME, **(call.get("dynamic_vars_applied") or {})}
     rendered_prompt = VoiceEngine.render_prompt(ast["system_prompt"], dynamic_vars)
-
-    all_transcripts = db.get_call_transcripts(call_id)
-    conv_history = [
-        {"role": "assistant" if t["speaker"] == "assistant" else "user", "content": t["message"]}
-        for t in all_transcripts[:-1]
-    ]
 
     ai_result = voice_engine.generate_chat_response(
         system_prompt=rendered_prompt,
@@ -245,9 +263,9 @@ def handle_signalwire_gather_turn(
     extracted = call.get("extracted_data", {})
     if detected_tool:
         extracted[detected_tool.get("tool", "unnamed_tool")] = detected_tool.get("parameters", {})
-        db.update_call(call_id, {"extracted_data": extracted, "outcome_status": "success"})
+        db.update_call(call_id, {"extracted_data": extracted, "outcome_status": "recorded_for_followup"})
         db.add_transcript_message(
-            call_id, "tool", f"Action Triggered: {detected_tool.get('tool')} {json.dumps(detected_tool.get('parameters', {}))}"
+            call_id, "tool", f"Details captured: {detected_tool.get('tool')} {json.dumps(detected_tool.get('parameters', {}))}"
         )
 
     cost_info = VoiceEngine.calculate_call_cost(new_duration, provider="signalwire")
@@ -259,12 +277,10 @@ def handle_signalwire_gather_turn(
         "cost_total": cost_info["cost_total"]
     })
 
-    # Create short-lived opaque TTS clip ID (zero conversation text in URL)
-    clip_id = None
-    if voice_engine.elevenlabs_key and voice_engine.elevenlabs_key.strip():
-        clip_id = db.create_tts_clip(reply_text, voice_id=ast.get("voice_id") or settings.ELEVENLABS_DEFAULT_VOICE_ID)
+    clip_id = create_voice_clip(reply_text, ast.get("voice_id"))
 
-    if any(p in user_input.lower() for p in ["goodbye", "bye", "that's all", "hang up"]):
+    closing_request = re.sub(r"[^\w\s']", "", user_input.casefold().replace("’", "'")).strip()
+    if closing_request in {"goodbye", "bye", "that's all", "hang up", "thanks goodbye", "thank you goodbye"}:
         db.update_call(call_id, {"status": "completed", "ended_at": datetime.utcnow().isoformat()})
         release_call_slot_safely(call_id, cost_info["cost_total"])
         return telephony.build_signalwire_cxml_hangup(reply_text, clip_id=clip_id)
@@ -462,6 +478,14 @@ try:
             detail="Outbound calling is completely disabled."
         )
 
+    @app.get("/api/receptionist/messages")
+    def list_receptionist_messages(admin=Depends(require_admin)):
+        try:
+            messages = db.list_receptionist_messages()
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=503, detail="Receptionist messages are unavailable") from exc
+        return JSONResponse({"messages": messages}, headers={"Cache-Control": "private, no-store"})
+
     @app.get("/api/calls")
     def list_calls(admin=Depends(require_admin)):
         if os.getenv("VERCEL"):
@@ -523,15 +547,10 @@ try:
         if not ast:
             raise HTTPException(status_code=404, detail="Assistant not found")
 
+        conv_history = build_conversation_history(db.get_call_transcripts(payload.call_id))
         db.add_transcript_message(payload.call_id, "human", payload.user_message)
-        dynamic_vars = call.get("dynamic_vars_applied", {})
+        dynamic_vars = {"business_name": settings.RECEPTIONIST_BUSINESS_NAME, **(call.get("dynamic_vars_applied") or {})}
         rendered_system_prompt = VoiceEngine.render_prompt(ast["system_prompt"], dynamic_vars)
-
-        all_transcripts = db.get_call_transcripts(payload.call_id)
-        conv_history = [
-            {"role": "assistant" if t["speaker"] == "assistant" else "user", "content": t["message"]}
-            for t in all_transcripts[:-1]
-        ]
 
         ai_result = voice_engine.generate_chat_response(
             system_prompt=rendered_system_prompt,
@@ -550,11 +569,11 @@ try:
         if detected_tool:
             extracted = call.get("extracted_data", {})
             extracted[detected_tool.get("tool", "unnamed_tool")] = detected_tool.get("parameters", {})
-            db.update_call(payload.call_id, {"extracted_data": extracted, "outcome_status": "success"})
+            db.update_call(payload.call_id, {"extracted_data": extracted, "outcome_status": "recorded_for_followup"})
             db.add_transcript_message(
                 payload.call_id,
                 "tool",
-                f"Action Triggered: {detected_tool.get('tool')} with {json.dumps(detected_tool.get('parameters', {}))}"
+                f"Details captured: {detected_tool.get('tool')} with {json.dumps(detected_tool.get('parameters', {}))}"
             )
 
         new_duration = min(call.get("duration_seconds", 0) + 15, settings.MAX_CALL_DURATION_SECONDS)

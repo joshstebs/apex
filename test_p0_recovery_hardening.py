@@ -94,7 +94,7 @@ def cmd(c):
             redis[marker] = acct_json
             return 1
         if "local raw = redis.call('GET', KEYS[1])" in script:
-            key, updates, transcript = c[3:]
+            key, _, updates, transcript, _, _ = c[3:]
             if key not in redis:
                 return 0
             state = json.loads(redis[key])

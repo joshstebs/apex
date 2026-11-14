@@ -57,7 +57,7 @@ def cmd(c):
             if float(redis.get(spend,0))+float(reserve)>float(budget):return 0
             redis[lock]=call;redis[spend]=str(float(redis.get(spend,0))+float(reserve));redis[acct]=acct_json;redis[marker]=acct_json;return 1
         if "local raw = redis.call('GET', KEYS[1])" in script:
-            key,updates,transcript=c[3:]
+            key, _, updates, transcript, _, _ = c[3:]
             if key not in redis:return 0
             state=json.loads(redis[key]);state['call'].update(json.loads(updates))
             if transcript:state['transcripts'].append(json.loads(transcript))

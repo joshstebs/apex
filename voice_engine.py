@@ -47,15 +47,16 @@ class VoiceEngine:
             messages.append({"role": turn["role"], "content": turn["content"]})
         messages.append({"role": "user", "content": new_human_input})
 
-        if tools:
+        tool_definitions = {tool["name"]: tool for tool in tools or [] if tool.get("name")}
+        if tool_definitions:
             tool_guide = "\n\nAVAILABLE TOOLS:\n"
-            for t in tools:
-                tool_guide += f"- {t.get('name')}: {t.get('description')}\n"
+            for name, tool in tool_definitions.items():
+                parameters = json.dumps(tool.get("parameters", {}))
+                tool_guide += f"- {name}: {tool.get('description')} Parameters: {parameters}\n"
             tool_guide += "If you have accomplished a milestone or acquired finalized details, emit a JSON block on a new line: ```json {\"tool\": \"tool_name\", \"parameters\": {...}} ```"
             messages[0]["content"] += tool_guide
 
         response_text = ""
-        detected_tool = None
 
         if self.hf_token and self.hf_token.strip():
             payload = json.dumps({
@@ -80,25 +81,40 @@ class VoiceEngine:
                         data = json.loads(resp.read().decode("utf-8"))
                         choices = data.get("choices", [])
                         if choices and isinstance(choices, list):
-                            response_text = choices[0].get("message", {}).get("content", "")
+                            content = choices[0].get("message", {}).get("content")
+                            if isinstance(content, str):
+                                response_text = content
             except Exception as e:
                 print(f"[VoiceEngine] HF Router notice: {e}")
 
         if not response_text:
-            response_text, detected_tool = self._heuristic_fallback_response(
+            response_text, _ = self._heuristic_fallback_response(
                 system_prompt, messages, new_human_input, tools
             )
 
         latency_ms = int((time.time() - start_time) * 1000)
 
-        if not detected_tool:
-            json_match = re.search(r"```json\s*(\{.*?\})\s*```", response_text, re.DOTALL)
-            if json_match:
-                try:
-                    detected_tool = json.loads(json_match.group(1))
-                    response_text = re.sub(r"```json\s*\{.*?\}\s*```", "", response_text, flags=re.DOTALL).strip()
-                except Exception:
-                    pass
+        detected_tool = None
+        tool_blocks = re.compile(r"```json\b(.*?)```", re.DOTALL | re.IGNORECASE)
+        matches = list(tool_blocks.finditer(response_text))
+        if matches:
+            response_text = tool_blocks.sub("", response_text).strip()
+        if len(matches) == 1:
+            try:
+                candidate = json.loads(matches[0].group(1))
+            except json.JSONDecodeError:
+                candidate = None
+            if isinstance(candidate, dict):
+                name = candidate.get("tool")
+                parameters = candidate.get("parameters", candidate.get("args"))
+                if isinstance(name, str) and name in tool_definitions and isinstance(parameters, dict):
+                    schema = tool_definitions[name].get("parameters") or {}
+                    captured = {key: value for key, value in parameters.items() if key in schema}
+                    if captured:
+                        detected_tool = {"tool": name, "parameters": captured}
+
+        if not response_text.strip():
+            response_text = "Is there anything else I can help you with?"
 
         return {
             "text": response_text.strip(),
