@@ -730,12 +730,14 @@ class Database:
                 return False, "Reservation accounting corrupt", None
             # Accounting disappeared between read and EVAL; do not guess success.
             try:
-                still = self._upstash_cmd(["GET", f"apex:acct:{call_id}"])
+                still = self._upstash_cmd(["GET", acct_key])
             except RuntimeError:
                 return False, "Durable budget/lock store unavailable", None
             if not still:
                 return False, "Reservation accounting unavailable", None
             return False, "Budget reconciliation not confirmed", None
+        if ledger == "drill":
+            return False, "Redis is not configured", None
         return True, None, "released"
 
     def save_durable_call_state(self, call_id: str, state_payload: Dict[str, Any]):

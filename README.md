@@ -147,6 +147,14 @@ Set `APEX_ENVIRONMENT=staging` on a Vercel preview and a free Redis database (Up
 
 `docs/RELEASE.md` lists the environment variable names, Redis keys, and the rollback procedure.
 
+To exercise a staging deployment without a carrier:
+
+```sh
+python3 scripts/staging_exercise.py --base-url https://<preview-host>
+```
+
+The admin token is read from `APEX_ADMIN_TOKEN` or `--token-file` and is not printed. The route is `POST /api/staging/exercise`. It returns 404 unless `APEX_ENVIRONMENT=staging`.
+
 The carrier-backed checks below are for a later, separate production rehearsal. They are not part of staging and they are not authorized by this branch:
 
 1. Keep `RECEPTIONIST_ENABLED=false` until a human has verified provider accounts, signatures, and spend caps.

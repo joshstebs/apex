@@ -683,6 +683,193 @@ def _dashboard_payload(reserve, reserve_error, spend, paused, scheduler, live, r
         "unavailable": unavailable,
     }
 
+DRILL_SIGNING_KEY = "staging-drill-signing-key"
+
+
+def _receptionist_template() -> Dict[str, Any]:
+    path = os.path.join(os.path.dirname(__file__), "prompts", "harbour_main_receptionist.json")
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _seed_drill_reservation(call_id: str, reserve: float = 1.0) -> None:
+    month = datetime.utcnow().strftime("%Y-%m")
+    accounting = {"call_id": call_id, "month": month, "reserve": reserve, "reconciled": False}
+    raw = json.dumps(accounting)
+    ttl = str(db.ACCOUNTING_TTL_SECONDS)
+    db._upstash_cmd(["SET", f"apex:drill:acct:{call_id}", raw, "EX", ttl])
+    db._upstash_cmd(["SET", f"apex:drill:lock:{call_id}", call_id])
+    db._upstash_cmd(["SET", f"apex:drill:spend:{call_id}", str(reserve)])
+    db._upstash_cmd(["SET", f"apex:drill:reserve:{call_id}", raw, "EX", ttl])
+
+
+def _cleanup_drill(call_id: str) -> None:
+    if not redis_configured():
+        return
+    for key in (
+        f"apex:drill:acct:{call_id}",
+        f"apex:drill:lock:{call_id}",
+        f"apex:drill:spend:{call_id}",
+        f"apex:drill:reserve:{call_id}",
+        f"apex:drill:message:{call_id}",
+        f"apex:settle:{call_id}",
+    ):
+        try:
+            db._upstash_cmd(["DEL", key])
+        except Exception:
+            return
+
+
+def run_staging_exercise() -> Dict[str, Any]:
+    """Run the receptionist path in-process. Never calls SignalWire or ElevenLabs.
+
+    Live webhooks stay refused. Settlement, when Redis is configured, uses only
+    apex:drill:* keys so the live slot and monthly spend are untouched.
+    """
+    if not settings.STAGING:
+        raise RuntimeError("Staging exercise refused")
+    template = _receptionist_template()
+    greeting = VoiceEngine.render_prompt(
+        template.get("first_message") or "Hello.",
+        {"business_name": settings.RECEPTIONIST_BUSINESS_NAME},
+    )
+    inbound_cxml = telephony.build_signalwire_cxml_gather(
+        "drill-inbound", template.get("id") or "tpl_hm_receptionist", greeting, clip_id=None
+    )
+    model_text = (
+        "I have the message for the team.\n```json\n"
+        '{"tool":"save_receptionist_message","parameters":'
+        '{"caller_name":"Sam","callback_number":"+15195550100",'
+        '"reason":"Dock question","preferred_contact_time":"morning"}}\n```'
+    )
+    spoken, tool = voice_engine.parse_tool_response(model_text, template.get("tools") or [])
+    history = build_conversation_history([
+        {"speaker": "assistant", "message": greeting},
+        {"speaker": "tool", "message": "Details captured: save_receptionist_message"},
+        {"speaker": "human", "message": "This is Sam. Please call me about the dock."},
+    ])
+    voicemail = voicemail_from_transcripts(
+        {
+            "phone_number": "+15195550100",
+            "dynamic_vars_applied": {"caller_number": "+15195550100"},
+            "extracted_data": {},
+        },
+        [
+            {"speaker": "assistant", "message": greeting},
+            {"speaker": "human", "message": "The shipment is at the side door."},
+            {"speaker": "human", "message": "Goodbye"},
+        ],
+    )
+    call_id = "drill" + uuid.uuid4().hex[:16]
+    status_params = {"CallSid": call_id, "CallStatus": "completed", "CallDuration": "30"}
+    status_url = "https://staging.invalid/webhooks/signalwire/status"
+    signature = telephony.compute_signalwire_laml_signature(DRILL_SIGNING_KEY, status_url, status_params)
+    forged = signature[:-1] + ("A" if not signature.endswith("A") else "B")
+    signature_valid = hmac.compare_digest(
+        signature, telephony.compute_signalwire_laml_signature(DRILL_SIGNING_KEY, status_url, status_params)
+    )
+    forged_rejected = not hmac.compare_digest(forged, signature)
+    tampered = dict(status_params, CallDuration="999")
+    tampered_rejected = telephony.compute_signalwire_laml_signature(
+        DRILL_SIGNING_KEY, status_url, tampered
+    ) != signature
+    live_block = staging_cxml_block() or ""
+    configured = redis_configured()
+    reachable = db.probe_redis() if configured else False
+    message_round_trip = False
+    settlement = "skipped"
+    duplicate = "skipped"
+    spend_unchanged = None
+    steps_ok = True
+    if configured and reachable and tool:
+        try:
+            _seed_drill_reservation(call_id, 1.0)
+            encoded = json.dumps(tool["parameters"])
+            db._upstash_cmd(["SET", f"apex:drill:message:{call_id}", encoded, "EX", "120"])
+            echoed = json.loads(db._upstash_cmd(["GET", f"apex:drill:message:{call_id}"]))
+            message_round_trip = echoed.get("caller_name") == "Sam"
+            first_cost = VoiceEngine.calculate_call_cost(30, provider="signalwire")["cost_total"]
+            ok, err, settlement = db.release_call_slot(call_id, first_cost, source="carrier", ledger="drill")
+            if not ok:
+                settlement = err or "failed"
+                steps_ok = False
+            spend_after = float(db._upstash_cmd(["GET", f"apex:drill:spend:{call_id}"]) or 0)
+            second_cost = VoiceEngine.calculate_call_cost(90, provider="signalwire")["cost_total"]
+            ok2, err2, duplicate = db.release_call_slot(call_id, second_cost, source="carrier", ledger="drill")
+            if not ok2:
+                duplicate = err2 or "failed"
+                steps_ok = False
+            spend_after_duplicate = float(db._upstash_cmd(["GET", f"apex:drill:spend:{call_id}"]) or 0)
+            spend_unchanged = abs(spend_after - spend_after_duplicate) < 1e-6
+            live_lock = db._upstash_cmd(["GET", db.ACTIVE_CALL_KEY])
+            if live_lock:
+                steps_ok = False
+        finally:
+            _cleanup_drill(call_id)
+    elif configured and not reachable:
+        settlement = "redis_unreachable"
+        duplicate = "redis_unreachable"
+        steps_ok = False
+    summary = {
+        "staging": True,
+        "providers_contacted": False,
+        "redis_configured": configured,
+        "redis_reachable": reachable,
+        "ok": bool(
+            steps_ok and signature_valid and forged_rejected and tampered_rejected
+            and tool and tool.get("tool") == "save_receptionist_message"
+            and voicemail and voicemail.get("capture") == "voicemail"
+            and "<Play" not in inbound_cxml and "<Say" in inbound_cxml
+            and "does not accept live calls" in live_block
+        ),
+        "steps": [
+            {"name": "redis_round_trip", "ok": (not configured) or reachable},
+            {
+                "name": "inbound",
+                "ok": "<Play" not in inbound_cxml and "<Say" in inbound_cxml,
+                "speech": "say",
+                "played_audio": False,
+            },
+            {
+                "name": "speech_turn",
+                "ok": "```" not in spoken and bool(tool) and all(
+                    "Details captured" not in turn["content"] for turn in history
+                ),
+                "spoken_text": spoken,
+                "history_hides_tool_events": all("Details captured" not in turn["content"] for turn in history),
+            },
+            {
+                "name": "message_capture",
+                "ok": bool(tool) and tool.get("parameters", {}).get("caller_name") == "Sam",
+                "tool": None if not tool else tool.get("tool"),
+                "redis_round_trip": message_round_trip,
+            },
+            {
+                "name": "voicemail",
+                "ok": bool(voicemail) and voicemail.get("capture") == "voicemail" and "side door" in voicemail.get("reason", ""),
+                "capture": None if not voicemail else voicemail.get("capture"),
+            },
+            {
+                "name": "signed_status",
+                "ok": signature_valid and forged_rejected and tampered_rejected,
+                "signature_valid": signature_valid,
+                "forged_rejected": forged_rejected,
+                "settlement": settlement,
+            },
+            {
+                "name": "duplicate_status",
+                "ok": (not configured) or (duplicate == "already_released" and spend_unchanged is True),
+                "settlement": duplicate,
+                "spend_unchanged": spend_unchanged,
+            },
+            {"name": "live_admission_refused", "ok": "does not accept live calls" in live_block},
+        ],
+    }
+    if not configured:
+        summary["notice"] = "Redis is not configured, so the drill ledger was not written."
+    return summary
+
+
 # =========================================================================
 # FASTAPI APPLICATION (VERCEL ASGI RUNTIME)
 # =========================================================================
@@ -903,6 +1090,23 @@ try:
             raise HTTPException(status_code=404, detail="Call not found")
         transcripts = db.get_call_transcripts(call_id)
         return {"call": c, "transcripts": transcripts}
+
+    @app.post("/api/staging/exercise")
+    def staging_exercise(request: Request):
+        if not settings.STAGING:
+            raise HTTPException(status_code=404, detail="Not found")
+        token = os.getenv("APEX_ADMIN_TOKEN", "")
+        header = request.headers.get("authorization", "")
+        presented = header[7:] if header.startswith("Bearer ") else ""
+        if not token or not presented or not hmac.compare_digest(presented, token):
+            raise HTTPException(status_code=401, detail="Administrator authentication required",
+                                headers={"WWW-Authenticate": "Bearer"})
+        try:
+            payload = run_staging_exercise()
+        except Exception as exc:
+            log_ops_failure("staging exercise", exc)
+            raise HTTPException(status_code=503, detail="Staging exercise failed") from exc
+        return JSONResponse(payload, headers={"Cache-Control": "private, no-store"})
 
     @app.get("/api/dashboard")
     def operations_dashboard(admin=Depends(require_admin)):
