@@ -26,6 +26,8 @@ redis = {}
 
 def cmd(c):
     op = c[0].upper()
+    if op == 'EXISTS':
+        return int(c[1] in redis)
     if op == 'GET':
         return redis.get(c[1])
     if op == 'SET':
@@ -38,8 +40,10 @@ def cmd(c):
     if op == 'EVAL':
         script = c[1]
         if 'local lock = redis.call' in script and 'KEYS[5]' in script:
-            lock, spend, marker, acct, state = c[3:8]
-            call, lock_ttl, marker_ttl, reserve, budget, acct_json, acct_ttl = c[8:]
+            lock, spend, marker, acct, state, pause = c[3:9]
+            call, lock_ttl, marker_ttl, reserve, budget, acct_json, acct_ttl = c[9:]
+            if pause in redis:
+                return 6
             if redis.get(lock) == call:
                 if acct in redis or marker in redis:
                     return 2

@@ -13,11 +13,12 @@ import glob
 import json
 import uuid
 import hmac
+import math
 import urllib.parse
 import base64
 import time
 from typing import Dict, Any, List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 from config import settings
 from database import Database
@@ -182,6 +183,8 @@ def handle_signalwire_gather_turn(
     if not call:
         return telephony.build_signalwire_cxml_hangup("Thank you for calling. Goodbye!")
     if os.getenv("VERCEL"):
+        if db._upstash_cmd(["EXISTS", db.CALL_PAUSE_KEY]):
+            return telephony.build_signalwire_cxml_hangup("This line is temporarily unavailable. Goodbye.")
         holder = db._upstash_cmd(["GET", "apex:active_call_lock"])
         if holder != call_id or call.get("status") != "in-progress":
             return telephony.build_signalwire_cxml_hangup("This call session has ended. Goodbye.")
@@ -382,6 +385,57 @@ try:
     def health_check():
         return get_sanitized_health_and_settings()
 
+    def require_operations(credentials: HTTPAuthorizationCredentials = Depends(bearer)):
+        token = os.getenv("APEX_OPERATIONS_TOKEN", "")
+        admin = os.getenv("APEX_ADMIN_TOKEN", "")
+        if len(token) < 32 or token == admin or not credentials or not hmac.compare_digest(
+            credentials.credentials.encode(), token.encode()
+        ):
+            raise HTTPException(status_code=401, detail="Operations authentication required")
+        if not os.getenv("VERCEL") or settings.durable_storage_backend() != "upstash_redis":
+            raise HTTPException(status_code=503, detail="Durable call control unavailable")
+
+    @app.get("/api/operations", dependencies=[Depends(require_operations)])
+    def operations_status(response: Response):
+        month = datetime.now(timezone.utc).strftime("%Y-%m")
+        try:
+            paused, spend, scheduler_at = db._upstash_cmd([
+                "MGET", db.CALL_PAUSE_KEY, f"apex:spend:{month}", "apex:operations:scheduler_at"
+            ])
+            estimated = float(spend) if spend is not None else 0.0
+            if not math.isfinite(estimated) or estimated < 0:
+                raise ValueError("Invalid spend")
+        except (RuntimeError, TypeError, ValueError) as exc:
+            raise HTTPException(status_code=503, detail="Operations state unavailable") from exc
+        flags = get_sanitized_health_and_settings()
+        response.headers["Cache-Control"] = "no-store"
+        return {
+            "paused": paused is not None,
+            "estimatedSpendUsd": estimated,
+            "budgetUsd": flags["monthly_budget_limit_usd"],
+            "schedulerRecentlySeen": bool(scheduler_at),
+            "carrierBillingCapVerified": None
+        }
+
+    @app.post("/api/operations/pause", dependencies=[Depends(require_operations)])
+    def pause_calls(response: Response):
+        # Set the flag and capture the active slot atomically with respect to admission.
+        try:
+            call_id = db._upstash_cmd([
+                "EVAL", "redis.call('SET', KEYS[1], '1'); return redis.call('GET', KEYS[2])",
+                "2", db.CALL_PAUSE_KEY, "apex:active_call_lock"
+            ])
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail="Could not verify the pause") from exc
+        carrier = "no_active_call"
+        if call_id:
+            try:
+                carrier = "requested" if telephony.terminate_signalwire_call(call_id) else "unconfirmed"
+            except (RuntimeError, ValueError, OSError):
+                carrier = "unconfirmed"
+        response.headers["Cache-Control"] = "no-store"
+        return {"paused": True, "carrierTermination": carrier}
+
     @app.get("/api/settings")
     def get_settings():
         return get_sanitized_health_and_settings()
@@ -580,6 +634,12 @@ try:
         Serves ElevenLabs audio using a short-lived opaque clip_id backed by temporary storage.
         Zero conversation text is ever exposed in URLs.
         """
+        if os.getenv("VERCEL"):
+            try:
+                if db._upstash_cmd(["EXISTS", db.CALL_PAUSE_KEY]):
+                    raise HTTPException(status_code=503, detail="Call handling is paused")
+            except RuntimeError as exc:
+                raise HTTPException(status_code=503, detail="Call state unavailable") from exc
         clip = db.get_tts_clip(clip_id)
         if not clip:
             raise HTTPException(status_code=404, detail="Audio clip expired or not found")
@@ -685,6 +745,7 @@ try:
             raise HTTPException(status_code=503, detail="Durable carrier enforcement unavailable")
         try:
             call_id = db._upstash_cmd(["GET", "apex:active_call_lock"])
+            db._upstash_cmd(["SET", "apex:operations:scheduler_at", "1", "EX", "180"])
             if not call_id:
                 return {"checked": True, "active": False, "termination_requested": False}
             call = db.get_call(call_id)

@@ -19,6 +19,7 @@ from config import settings
 class Database:
     # Durable accounting outlives the short marker and 24h call-state TTL.
     ACCOUNTING_TTL_SECONDS = 604800
+    CALL_PAUSE_KEY = "apex:operations:paused"
 
     def __init__(self, db_path: str = None):
         self.db_path = db_path or settings.DB_PATH
@@ -291,6 +292,7 @@ class Database:
             acct_ttl = str(self.ACCOUNTING_TTL_SECONDS)
             # KEYS: 1=active call lock, 2=current-month spend, 3=short marker, 4=durable accounting, 5=durable call state
             script = """
+            if redis.call('EXISTS', KEYS[6]) == 1 then return 6 end
             local lock = redis.call('GET', KEYS[1])
             if lock == ARGV[1] then
               if redis.call('EXISTS', KEYS[4]) == 1 or redis.call('EXISTS', KEYS[3]) == 1 then return 2 end
@@ -342,14 +344,16 @@ class Database:
             return 1
             """
             try:
-                ok = self._upstash_cmd(["EVAL", script, "5", "apex:active_call_lock",
+                ok = self._upstash_cmd(["EVAL", script, "6", "apex:active_call_lock",
                                         f"apex:spend:{month_key}", f"apex:reserve:{call_id}",
-                                        f"apex:acct:{call_id}", f"apex:call:{call_id}", call_id,
+                                        f"apex:acct:{call_id}", f"apex:call:{call_id}", self.CALL_PAUSE_KEY, call_id,
                                         str(settings.MAX_CALL_DURATION_SECONDS + 15),
                                         marker_ttl, str(reserve), str(settings.MONTHLY_BUDGET_LIMIT_USD),
                                         accounting_value, acct_ttl])
             except RuntimeError:
                 return False, "Durable budget/lock store unavailable", None
+            if ok == 6:
+                return False, "Call handling is paused", "paused"
             if ok == 0:
                 return False, "Concurrent call or budget limit reached", None
             if ok == 5:

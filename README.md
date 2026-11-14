@@ -116,3 +116,19 @@ The project uses Vercel's native FastAPI detection of root `app.py`.
 Do not add a catch-all rewrite to `/api/index`, which causes FastAPI to receive
 an incorrect path and return HTTP 404 for the main application. The standalone
 `api/index.py` is retained as a legacy compatibility entrypoint only.
+
+### Command Center pause control
+
+Set a dedicated `APEX_OPERATIONS_TOKEN` before staging the operations endpoints. The token
+must be at least 32 characters and differ from `APEX_ADMIN_TOKEN`. Where Vercel and Upstash
+are configured, `GET /api/operations` returns a Redis admission estimate and scheduler heartbeat.
+`POST /api/operations/pause` atomically sets `apex:operations:paused` and reads the active-call
+slot. It then requests carrier termination when a slot is occupied. Carrier acceptance is
+reported separately, and signed status callbacks still reconcile costs. A provider request
+already dispatched can run to completion.
+
+To restore service, first verify the carrier has ended any active call and resolve the incident.
+Then remove only the `apex:operations:paused` key in the correct Upstash database. The application
+still requires its normal inbound configuration and budget eligibility. Use the provider consoles
+for actual billing and provider-side caps. The scheduled enforcer heartbeat expires after three
+minutes and indicates an authenticated check-in.

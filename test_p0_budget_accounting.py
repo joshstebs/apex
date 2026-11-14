@@ -26,6 +26,8 @@ cmd_log = []
 def cmd(c):
     op = c[0].upper()
     cmd_log.append(op)
+    if op == 'EXISTS':
+        return int(c[1] in redis)
     if op == 'GET':
         return redis.get(c[1])
     if op == 'SET':
@@ -40,8 +42,10 @@ def cmd(c):
         eval_log.append(script[:60])
         # Admission: lock + spend + marker + durable accounting + durable state
         if 'local lock = redis.call' in script and 'KEYS[5]' in script:
-            lock, spend, marker, acct, state = c[3:8]
-            call, lock_ttl, marker_ttl, reserve, budget, acct_json, acct_ttl = c[8:]
+            lock, spend, marker, acct, state, pause = c[3:9]
+            call, lock_ttl, marker_ttl, reserve, budget, acct_json, acct_ttl = c[9:]
+            if pause in redis:
+                return 6
             if redis.get(lock) == call:
                 if acct in redis or marker in redis:
                     return 2
