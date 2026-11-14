@@ -11,6 +11,8 @@ import math
 import time
 import secrets
 import os
+import re
+import base64
 import urllib.request
 import urllib.parse
 from datetime import datetime
@@ -26,6 +28,9 @@ class Database:
 
     def __init__(self, db_path: str = None):
         self.db_path = db_path or settings.DB_PATH
+        self._recent_errors: List[Dict[str, str]] = []
+        self._local_tts_audio: Dict[str, bytes] = {}
+        self._webhook_times: List[float] = []
         if not os.getenv("VERCEL"):
             self._init_db()
 
@@ -270,6 +275,87 @@ class Database:
             return None, "Invalid call budget reservation"
         return reserve, None
 
+    def note_ops_error(self, code: str) -> None:
+        """Record a short error code for the operations dashboard. Never store exception text."""
+        safe = code if re.fullmatch(r"[a-z0-9_]{1,64}", code or "") else "unspecified"
+        entry = {"at": datetime.utcnow().isoformat() + "Z", "code": safe}
+        self._recent_errors.append(entry)
+        del self._recent_errors[:-50]
+        if not (settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN):
+            return
+        try:
+            self._upstash_cmd(["LPUSH", "apex:ops:errors", json.dumps(entry)])
+            self._upstash_cmd(["LTRIM", "apex:ops:errors", "0", "49"])
+        except Exception:
+            return
+
+    def list_ops_errors(self) -> List[Dict[str, str]]:
+        if settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN:
+            try:
+                raw = self._upstash_cmd(["LRANGE", "apex:ops:errors", "0", "49"])
+            except Exception:
+                raw = None
+            if isinstance(raw, list):
+                errors = []
+                for item in raw:
+                    try:
+                        parsed = json.loads(item) if isinstance(item, str) else item
+                    except (TypeError, json.JSONDecodeError):
+                        continue
+                    if isinstance(parsed, dict) and re.fullmatch(r"[a-z0-9_]{1,64}", str(parsed.get("code", ""))):
+                        errors.append({"at": str(parsed.get("at", "")), "code": parsed["code"]})
+                return errors
+        return list(self._recent_errors)
+
+    def staging_request_allowed(self) -> bool:
+        """Count staging webhook attempts. Production never consults this limit."""
+        if not settings.STAGING:
+            return True
+        limit = settings.STAGING_WEBHOOK_RATE_LIMIT_PER_MINUTE
+        if settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN:
+            try:
+                count = int(self._upstash_cmd(["INCR", "apex:staging:webhook_rate"]))
+                if count == 1:
+                    self._upstash_cmd(["EXPIRE", "apex:staging:webhook_rate", "60"])
+                return count <= limit
+            except Exception:
+                self.note_ops_error("staging_rate_limit_unavailable")
+                return False
+        now = time.time()
+        self._webhook_times = [stamp for stamp in self._webhook_times if now - stamp < 60]
+        if len(self._webhook_times) >= limit:
+            return False
+        self._webhook_times.append(now)
+        return True
+
+    def cache_tts_audio(self, clip_id: str, audio: bytes) -> bool:
+        """Store synthesized audio so a carrier retry does not buy the clip again."""
+        if not clip_id or not audio:
+            return False
+        self._local_tts_audio[clip_id] = audio
+        if not (settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN):
+            return True
+        try:
+            encoded = base64.b64encode(audio).decode("ascii")
+            result = self._upstash_cmd(["SET", f"apex:tts_audio:{clip_id}", encoded, "EX", "120"])
+        except Exception:
+            return False
+        return result == "OK"
+
+    def read_cached_tts_audio(self, clip_id: str) -> Optional[bytes]:
+        cached = self._local_tts_audio.get(clip_id)
+        if cached:
+            return cached
+        if not (settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN):
+            return None
+        encoded = self._upstash_cmd(["GET", f"apex:tts_audio:{clip_id}"])
+        if not encoded or not isinstance(encoded, str):
+            return None
+        try:
+            return base64.b64decode(encoded)
+        except Exception:
+            return None
+
     def try_acquire_call_slot(self, call_record: Dict[str, Any]) -> Tuple[bool, Optional[str], Optional[str]]:
         """
         Atomically checks $5.00 monthly budget cap and 1-concurrent-call limit across instances.
@@ -278,6 +364,8 @@ class Database:
         "duplicate" when a known completed CallSid must not be re-admitted as billable.
         """
         call_id = call_record["id"]
+        if settings.STAGING or settings.MONTHLY_BUDGET_LIMIT_USD <= 0:
+            return False, "Call admission blocked by staging or budget cap", None
         month_key = datetime.utcnow().strftime("%Y-%m")
 
         state_payload = {"call": call_record, "transcripts": []}
@@ -588,7 +676,7 @@ class Database:
         local raw = redis.call('GET', KEYS[1])
         if not raw then return 0 end
         local state = cjson.decode(raw)
-        if ARGV[3] == 'active' and state.call.status ~= 'in-progress' then return 2 end
+        if ARGV[5] == 'active' and state.call.status ~= 'in-progress' then return 2 end
         local updates = cjson.decode(ARGV[1])
         for k,v in pairs(updates) do state.call[k] = v end
         if ARGV[2] ~= '' then
@@ -596,10 +684,26 @@ class Database:
           table.insert(state.transcripts, msg)
         end
         redis.call('SET', KEYS[1], cjson.encode(state), 'EX', 86400)
+        local noted_at = tonumber(ARGV[4])
+        if noted_at and ARGV[3] ~= '' then
+          redis.call('ZADD', 'apex:recent_calls', noted_at, ARGV[3])
+          redis.call('ZREMRANGEBYRANK', 'apex:recent_calls', 0, -51)
+          redis.call('EXPIRE', 'apex:recent_calls', 86400)
+        end
+        local message = updates.extracted_data and updates.extracted_data.save_receptionist_message
+        if type(message) == 'table' and next(message) and noted_at then
+          redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', noted_at - 86400)
+          redis.call('ZADD', KEYS[2], noted_at, ARGV[3])
+          redis.call('EXPIRE', KEYS[2], 86400)
+        end
         return 1
         """
-        command = ["EVAL", script, "1", f"apex:call:{call_id}",
-                   json.dumps(updates or {}), json.dumps(transcript) if transcript else ""]
+        # ARGV: updates, transcript, call id, unix time, optional "active".
+        # Recent-call indexing uses a fixed key because this command shape is
+        # shared with the receptionist message index (two KEYS).
+        command = ["EVAL", script, "2", f"apex:call:{call_id}", "apex:receptionist_messages",
+                   json.dumps(updates or {}), json.dumps(transcript) if transcript else "",
+                   call_id, str(int(time.time()))]
         if only_if_active:
             command.append("active")
         result = self._upstash_cmd(command)
@@ -794,6 +898,63 @@ class Database:
             for key in ("dynamic_vars_applied", "extracted_data"):
                 data[key] = json.loads(data[key]) if data.get(key) else {}
             return data
+
+    def list_recent_calls(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """Recent calls for the operations dashboard. Phone numbers stay out of this index."""
+        limit = max(1, min(int(limit), 50))
+        if settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN:
+            ids = self._upstash_cmd(["ZREVRANGE", "apex:recent_calls", "0", str(limit - 1)])
+            if not isinstance(ids, list):
+                raise RuntimeError("Recent call index unavailable")
+            calls = []
+            for call_id in ids:
+                if not isinstance(call_id, str):
+                    continue
+                call = self.get_call(call_id)
+                if call:
+                    calls.append(call)
+            return calls
+        if os.getenv("VERCEL"):
+            raise RuntimeError("Recent call index requires Redis")
+        return self.list_calls(limit)
+
+    def list_receptionist_messages(self) -> List[Dict[str, Any]]:
+        """Return the newest 50 captured receptionist messages from shared call state."""
+        if not (settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN):
+            if os.getenv("VERCEL"):
+                raise RuntimeError("Shared Redis message storage is required")
+            messages = []
+            for call in self.list_calls(50):
+                message = (call.get("extracted_data") or {}).get("save_receptionist_message")
+                if isinstance(message, dict) and message:
+                    messages.append({
+                        "call_id": call.get("id"),
+                        "started_at": call.get("started_at"),
+                        "message": message,
+                    })
+            return messages
+        script = """
+        local ids = redis.call('ZREVRANGEBYSCORE', KEYS[1], '+inf', ARGV[1], 'LIMIT', 0, 50)
+        local messages = {}
+        for _, id in ipairs(ids) do
+          local raw = redis.call('GET', 'apex:call:' .. id)
+          if raw then
+            local call = cjson.decode(raw).call
+            local message = call.extracted_data and call.extracted_data.save_receptionist_message
+            if type(message) == 'table' and next(message) then
+              table.insert(messages, cjson.encode({
+                call_id = id, started_at = call.started_at, message = message
+              }))
+            end
+          end
+        end
+        return messages
+        """
+        cutoff = str(int(time.time()) - 86400)
+        messages = self._upstash_cmd(["EVAL", script, "1", "apex:receptionist_messages", cutoff])
+        if not isinstance(messages, list):
+            raise RuntimeError("Message storage returned an invalid response")
+        return [json.loads(message) for message in messages]
 
     def list_calls(self, limit: int = 50) -> List[Dict[str, Any]]:
         if os.getenv("VERCEL"):

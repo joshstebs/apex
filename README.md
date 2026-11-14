@@ -135,29 +135,23 @@ for actual billing and provider-side caps. The scheduled enforcer heartbeat expi
 minutes and indicates an authenticated check-in.
 
 
-### Staging verification and recovery
+### Operations dashboard
 
-1. Use the SignalWire test number and a separate Redis database for staging. Set
-   the signed voice, gather and status callbacks to the same staging origin, and
-   configure the provider credentials there. Set `RECEPTIONIST_ENABLED=false` until
-   the scheduler can authenticate and `/api/operations` reports a recent heartbeat.
-2. Run the enforcer every minute from the staging host. Send a POST to
-   `/api/maintenance/enforce-call-duration` with `Authorization: Bearer <CRON_SECRET>`.
-   Keep that header in a mode-0600 curl config file or the scheduler's secret store.
-   Treat non-2xx responses as failed runs. Use a stable host that the carrier can
-   reach without browser login.
-3. On the test number, verify valid and invalid signatures, a normal hangup and its
-   terminal callback, and scheduler termination with a short staging duration. Verify
-   the Redis reservation remains held until the terminal callback, and duplicate
-   callbacks do not charge the budget twice. Disable the staging scheduler long
-   enough for its heartbeat to expire and verify that new inbound calls are declined.
-4. If a slot remains held, pause call handling, inspect the carrier's call record and
-   recover the signed terminal callback or settle the reservation against the verified
-   duration. Keep the slot held until the carrier has confirmed the call ended.
-   Check provider billing independently of the application's estimated monthly ledger.
-   Before rolling back to a release with an expiring call lock, pause inbound handling
-   and confirm the slot is empty.
+`GET /` and `GET /operations` show service status, estimated spend versus the cap, the live call, recent calls, receptionist messages, and error codes after the administrator token is entered. The token stays in tab memory. `GET /api/dashboard` is the same snapshot and requires `Authorization: Bearer <APEX_ADMIN_TOKEN>`. Responses omit secrets and full recording audio. Audio recording is not enabled.
 
-Run `python -m compileall -q .` and the `test_*.py` scripts locally. The lifecycle
-integration test starts its own loopback Redis process and requires `redis-server`
-and `redis-cli`. It uses signed callback fixtures and stubs carrier termination.
+Spoken replies use a cached ElevenLabs clip only after synthesis succeeds. If clip storage or synthesis fails, the cXML uses SignalWire `<Say>`. A call that ends without a model tool call stores the caller's transcript as a voicemail message.
+
+### Staging that cannot place calls
+
+Set `APEX_ENVIRONMENT=staging` on a Vercel preview and a free Redis database (Upstash free tier, or loopback Redis for tests). Staging forces a **$0** monthly cap in code, selects the mock telephony provider, refuses inbound admission, rate-limits webhooks, and does not open a carrier connection. `MONTHLY_BUDGET_LIMIT_USD` and `APEX_TELEPHONY_PROVIDER` cannot override those locks. Outbound PSTN stays disabled. Do not point `+12267732234` or any customer number at this deployment.
+
+`docs/RELEASE.md` lists the environment variable names, Redis keys, and the rollback procedure.
+
+The carrier-backed checks below are for a later, separate production rehearsal. They are not part of staging and they are not authorized by this branch:
+
+1. Keep `RECEPTIONIST_ENABLED=false` until a human has verified provider accounts, signatures, and spend caps.
+2. Run the enforcer every minute only on a host that is allowed to control a real call. Send a POST to `/api/maintenance/enforce-call-duration` with `Authorization: Bearer <CRON_SECRET>`.
+3. A hosted call keeps its Redis reservation until the signed terminal callback. Duplicate callbacks must not charge the estimate twice. A missing callback holds the slot.
+4. Before rolling back to a build whose call lock expires, pause inbound handling and confirm `apex:active_call_lock` is empty.
+
+Run `python -m compileall -q .` and the `test_*.py` scripts locally. Lifecycle and lock tests start loopback Redis and stub carrier termination.

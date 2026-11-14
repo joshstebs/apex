@@ -64,8 +64,25 @@ class AppSettings:
         self.MONTHLY_BUDGET_LIMIT_USD: float = float(os.getenv("MONTHLY_BUDGET_LIMIT_USD", "5.00"))
         self.TTS_CLIP_TTL_SECONDS: int = int(os.getenv("TTS_CLIP_TTL_SECONDS", "120"))  # Short-lived 120s TTL
         self.HTTP_UPSTREAM_TIMEOUT_SECONDS: float = float(os.getenv("HTTP_UPSTREAM_TIMEOUT_SECONDS", "5.5"))
+
+        environment = os.getenv("APEX_ENVIRONMENT", "production" if os.getenv("VERCEL") else "local").strip().lower()
+        self.APEX_ENVIRONMENT: str = environment if environment in ("local", "staging", "production") else "local"
+        self.STAGING: bool = self.APEX_ENVIRONMENT == "staging"
+        # Staging spend is fixed in code. MONTHLY_BUDGET_LIMIT_USD cannot raise it.
+        if self.STAGING:
+            self.MONTHLY_BUDGET_LIMIT_USD = 0.0
+        provider = os.getenv("APEX_TELEPHONY_PROVIDER", "mock" if self.STAGING else "signalwire").strip().lower()
+        self.TELEPHONY_PROVIDER: str = "mock" if self.STAGING or provider == "mock" else "signalwire"
+        try:
+            staging_rate = int(os.getenv("STAGING_WEBHOOK_RATE_LIMIT_PER_MINUTE", "10"))
+        except (TypeError, ValueError):
+            staging_rate = 10
+        self.STAGING_WEBHOOK_RATE_LIMIT_PER_MINUTE: int = max(1, min(staging_rate, 60))
+        self.OUTBOUND_NUMBER_ALLOWLIST: tuple = tuple(
+            item.strip() for item in os.getenv("OUTBOUND_NUMBER_ALLOWLIST", "").split(",") if item.strip()
+        )
         
-        # Outbound calling is completely disabled
+        # Outbound calling is completely disabled. The allowlist cannot turn it on.
         self.OUTBOUND_CALLING_ENABLED: bool = False
         
         default_db = "/tmp/voice_agents.db" if os.getenv("VERCEL") else "voice_agents.db"
@@ -74,6 +91,20 @@ class AppSettings:
     def get_webhook_signing_key(self) -> str:
         """Returns the configured SignalWire Signing Key (or API Token fallback)."""
         return self.SIGNALWIRE_SIGNING_KEY or self.SIGNALWIRE_API_TOKEN
+
+    def use_carrier_speech(self) -> bool:
+        """Staging and the mock carrier speak with <Say> and do not call ElevenLabs."""
+        if self.STAGING or self.TELEPHONY_PROVIDER == "mock":
+            return True
+        return os.getenv("APEX_TTS_PROVIDER", "elevenlabs").strip().lower() == "carrier"
+
+    def inbound_live_calls_possible(self) -> bool:
+        return (
+            not self.STAGING
+            and self.TELEPHONY_PROVIDER == "signalwire"
+            and self.RECEPTIONIST_ENABLED
+            and self.MONTHLY_BUDGET_LIMIT_USD > 0
+        )
 
     def durable_storage_backend(self) -> str:
         if self.UPSTASH_REDIS_REST_URL and self.UPSTASH_REDIS_REST_TOKEN:
