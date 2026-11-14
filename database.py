@@ -558,10 +558,18 @@ class Database:
           table.insert(state.transcripts, msg)
         end
         redis.call('SET', KEYS[1], cjson.encode(state), 'EX', 86400)
+        local message = updates.extracted_data and updates.extracted_data.save_receptionist_message
+        if type(message) == 'table' and next(message) then
+          local now = tonumber(ARGV[4])
+          redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', now - 86400)
+          redis.call('ZADD', KEYS[2], now, ARGV[3])
+          redis.call('EXPIRE', KEYS[2], 86400)
+        end
         return 1
         """
-        result = self._upstash_cmd(["EVAL", script, "1", f"apex:call:{call_id}",
-                                   json.dumps(updates or {}), json.dumps(transcript) if transcript else ""])
+        result = self._upstash_cmd(["EVAL", script, "2", f"apex:call:{call_id}", "apex:receptionist_messages",
+                                   json.dumps(updates or {}), json.dumps(transcript) if transcript else "",
+                                   call_id, str(int(time.time()))])
         if result != 1:
             raise RuntimeError("Call state missing; refusing unsafe local fallback")
 
@@ -753,6 +761,33 @@ class Database:
             for key in ("dynamic_vars_applied", "extracted_data"):
                 data[key] = json.loads(data[key]) if data.get(key) else {}
             return data
+
+    def list_receptionist_messages(self) -> List[Dict[str, Any]]:
+        """Return the newest 50 captured receptionist messages from shared call state."""
+        if not (settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN):
+            raise RuntimeError("Shared Redis message storage is required")
+        script = """
+        local ids = redis.call('ZREVRANGEBYSCORE', KEYS[1], '+inf', ARGV[1], 'LIMIT', 0, 50)
+        local messages = {}
+        for _, id in ipairs(ids) do
+          local raw = redis.call('GET', 'apex:call:' .. id)
+          if raw then
+            local call = cjson.decode(raw).call
+            local message = call.extracted_data and call.extracted_data.save_receptionist_message
+            if type(message) == 'table' and next(message) then
+              table.insert(messages, cjson.encode({
+                call_id = id, started_at = call.started_at, message = message
+              }))
+            end
+          end
+        end
+        return messages
+        """
+        cutoff = str(int(time.time()) - 86400)
+        messages = self._upstash_cmd(["EVAL", script, "1", "apex:receptionist_messages", cutoff])
+        if not isinstance(messages, list):
+            raise RuntimeError("Message storage returned an invalid response")
+        return [json.loads(message) for message in messages]
 
     def list_calls(self, limit: int = 50) -> List[Dict[str, Any]]:
         if os.getenv("VERCEL"):

@@ -97,7 +97,7 @@ def cmd(c):
             return 1
         # Atomic state update
         if "local raw = redis.call('GET', KEYS[1])" in script:
-            key, updates, transcript = c[3:]
+            key, _, updates, transcript, _, _ = c[3:]
             if key not in redis:
                 return 0
             state = json.loads(redis[key])

@@ -478,6 +478,14 @@ try:
             detail="Outbound calling is completely disabled."
         )
 
+    @app.get("/api/receptionist/messages")
+    def list_receptionist_messages(admin=Depends(require_admin)):
+        try:
+            messages = db.list_receptionist_messages()
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=503, detail="Receptionist messages are unavailable") from exc
+        return JSONResponse({"messages": messages}, headers={"Cache-Control": "private, no-store"})
+
     @app.get("/api/calls")
     def list_calls(admin=Depends(require_admin)):
         if os.getenv("VERCEL"):

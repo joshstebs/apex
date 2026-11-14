@@ -20,3 +20,4 @@ jobs:
       - run: python test_signalwire_elevenlabs_setup.py
       - run: python test_message_capture.py
       - run: python test_voice_clip_fallback.py
+      - run: python test_receptionist_inbox.py
