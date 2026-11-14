@@ -50,7 +50,7 @@ def check_lifecycle(command):
         with patch.dict(os.environ, {"APEX_MAX_CALL_RESERVE_USD": "nan"}):
             assert admit(first)[1] == "Invalid call budget reservation"
         no_call = client.post(maintenance_url, headers=scheduler_headers)
-        assert no_call.json() == {"checked": True, "active": False, "termination_requested": False}
+        assert no_call.json() == {"checked": True, "active": False, "termination_requested": False, "stale_settled": 0}
         assert 0 < command(["TTL", db.SCHEDULER_KEY]) <= 180
 
         assert admit(first) == (True, None, "created")

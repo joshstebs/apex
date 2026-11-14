@@ -61,6 +61,12 @@ class AppSettings:
         # Hard Budget, Concurrency, Duration & Outbound Lock Guardrails
         self.MAX_CONCURRENT_CALLS: int = int(os.getenv("MAX_CONCURRENT_CALLS", "1"))
         self.MAX_CALL_DURATION_SECONDS: int = int(os.getenv("MAX_CALL_DURATION_SECONDS", "1200"))  # 20 minutes, webhook-level guard only
+        try:
+            grace = int(os.getenv("STALE_SETTLEMENT_GRACE_SECONDS", "300"))
+        except (TypeError, ValueError):
+            grace = 300
+        # Wait this long after the hard cap before a missing status callback is settled once.
+        self.STALE_SETTLEMENT_GRACE_SECONDS: int = max(60, min(grace, 3600))
         self.MONTHLY_BUDGET_LIMIT_USD: float = float(os.getenv("MONTHLY_BUDGET_LIMIT_USD", "5.00"))
         self.TTS_CLIP_TTL_SECONDS: int = int(os.getenv("TTS_CLIP_TTL_SECONDS", "120"))  # Short-lived 120s TTL
         self.HTTP_UPSTREAM_TIMEOUT_SECONDS: float = float(os.getenv("HTTP_UPSTREAM_TIMEOUT_SECONDS", "5.5"))

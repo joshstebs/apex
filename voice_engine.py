@@ -93,10 +93,19 @@ class VoiceEngine:
             )
 
         latency_ms = int((time.time() - start_time) * 1000)
+        response_text, detected_tool = self.parse_tool_response(response_text, tools)
+        return {
+            "text": response_text,
+            "latency_ms": latency_ms,
+            "tool_call": detected_tool
+        }
 
+    def parse_tool_response(self, response_text: str, tools: Optional[List[Dict[str, Any]]] = None) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """Strip one tool JSON block from spoken text. Does not call a provider."""
+        tool_definitions = {tool["name"]: tool for tool in tools or [] if tool.get("name")}
         detected_tool = None
         tool_blocks = re.compile(r"```json\b(.*?)```", re.DOTALL | re.IGNORECASE)
-        matches = list(tool_blocks.finditer(response_text))
+        matches = list(tool_blocks.finditer(response_text or ""))
         if matches:
             response_text = tool_blocks.sub("", response_text).strip()
         if len(matches) == 1:
@@ -112,15 +121,9 @@ class VoiceEngine:
                     captured = {key: value for key, value in parameters.items() if key in schema}
                     if captured:
                         detected_tool = {"tool": name, "parameters": captured}
-
-        if not response_text.strip():
+        if not (response_text or "").strip():
             response_text = "Is there anything else I can help you with?"
-
-        return {
-            "text": response_text.strip(),
-            "latency_ms": latency_ms,
-            "tool_call": detected_tool
-        }
+        return response_text.strip(), detected_tool
 
     def _heuristic_fallback_response(
         self,

@@ -111,8 +111,13 @@ def cmd(c):
             redis[key] = json.dumps(state)
             return 1
         if "local raw = redis.call('GET', KEYS[3])" in script:
-            lock, spend, acct, marker = c[3:7]
-            call, delta, now, acct_ttl = c[7:]
+            numkeys = int(c[2])
+            keys = c[3:3 + numkeys]
+            rest = c[3 + numkeys:]
+            lock, spend, acct, marker = keys[:4]
+            call, delta, now, acct_ttl = rest[:4]
+            source = rest[4] if len(rest) > 4 else "carrier"
+            new_cost = float(rest[5]) if len(rest) > 5 else None
             raw = redis.get(acct)
             if not raw:
                 return 0
@@ -121,12 +126,23 @@ def cmd(c):
             except Exception:
                 return 3
             if accounting.get('reconciled') is True:
+                previous = accounting.get('settlement_source') or 'carrier'
+                if source == 'carrier' and previous in ('stale_estimate', 'manual') and new_cost is not None:
+                    settled = float(accounting.get('settled_cost') or 0)
+                    redis[spend] = str(float(redis.get(spend, 0)) + (new_cost - settled))
+                    accounting['settled_cost'] = new_cost
+                    accounting['settlement_source'] = 'carrier'
+                    redis[acct] = json.dumps(accounting)
+                    return 4
                 return 2
             if redis.get(lock) == call:
                 redis.pop(lock, None)
             redis[spend] = str(float(redis.get(spend, 0)) + float(delta))
             accounting['reconciled'] = True
             accounting['reconciled_at'] = now
+            accounting['settlement_source'] = source
+            if new_cost is not None:
+                accounting['settled_cost'] = new_cost
             redis[acct] = json.dumps(accounting)
             redis.pop(marker, None)
             return 1

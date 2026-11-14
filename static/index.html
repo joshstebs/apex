@@ -43,6 +43,7 @@
     <p id="error" role="alert"></p>
   </section>
 
+  <p id="notices" role="status"></p>
   <section>
     <h2>Budget</h2>
     <p class="muted">Estimated application spend versus the configured cap. This is not a carrier invoice.</p>
@@ -67,6 +68,11 @@
   </section>
 
   <section>
+    <h2>Unsettled calls</h2>
+    <p class="muted">Reservations settled from the duration cap because no carrier status arrived. A later status callback corrects the estimate.</p>
+    <ul id="stale"></ul>
+  </section>
+  <section>
     <h2>Errors</h2>
     <ul id="errors"></ul>
   </section>
@@ -89,7 +95,9 @@ function clearDashboard() {
   $("budget").textContent = "Sign in to load spend and cap.";
   $("budget-bar").style.width = "0";
   $("live-call").textContent = "Sign in to load call status.";
+  $("notices").textContent = "";
   $("recent-calls").replaceChildren();
+  $("stale").replaceChildren();
   $("messages").replaceChildren();
   $("errors").replaceChildren();
 }
@@ -101,6 +109,7 @@ function addItem(listId, text) {
 }
 
 function renderDashboard(data) {
+  $("notices").textContent = (data.notices || []).join(" ");
   const budget = data.budget || {};
   const spend = Number(budget.spend_usd);
   const cap = Number(budget.cap_usd);
@@ -123,6 +132,13 @@ function renderDashboard(data) {
   if (!calls.length) addItem("recent-calls", "No recent calls.");
   calls.forEach((call) => {
     addItem("recent-calls", [call.started_at, call.status, call.outcome_status, call.id].filter(Boolean).join(" · "));
+  });
+
+  $("stale").replaceChildren();
+  const stale = data.stale_unsettled || [];
+  if (!stale.length) addItem("stale", "No unsettled calls.");
+  stale.forEach((call) => {
+    addItem("stale", [call.started_at, call.status, call.settlement_source, call.cost_total, call.id].filter((part) => part !== undefined && part !== null && part !== "").join(" · "));
   });
 
   $("messages").replaceChildren();

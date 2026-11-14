@@ -10,12 +10,14 @@ ApexVoice AI: Vercel-Ready Autonomous Telephony Platform
 """
 import os
 import sqlite3
+import sys
 import re
 import glob
 import json
 import uuid
 import hmac
 import math
+import time
 import urllib.parse
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
@@ -95,32 +97,143 @@ def remember_caller_message(call_id: str) -> None:
         if isinstance(existing, dict) and existing:
             return
         transcripts = db.get_call_transcripts(call_id)
-        caller_lines = [
-            str(entry.get("message", "")).strip()
-            for entry in transcripts
-            if entry.get("speaker") in ("human", "user") and str(entry.get("message", "")).strip()
-        ]
-        if not caller_lines:
+        message = voicemail_from_transcripts(call, transcripts)
+        if not message:
             return
-        dynamic = call.get("dynamic_vars_applied") or {}
-        caller_number = ""
-        if isinstance(dynamic, dict):
-            caller_number = str(dynamic.get("caller_number") or "")
-        if not caller_number:
-            caller_number = str(call.get("phone_number") or "")
-        extracted["save_receptionist_message"] = {
-            "caller_name": "",
-            "callback_number": caller_number,
-            "reason": " ".join(caller_lines)[:1000],
-            "preferred_contact_time": "",
-            "capture": "voicemail",
-        }
+        extracted["save_receptionist_message"] = message
         db.update_call(call_id, {
             "extracted_data": extracted,
             "outcome_status": "recorded_for_followup",
         })
     except (RuntimeError, OSError, sqlite3.Error, ValueError, TypeError):
         db.note_ops_error("voicemail_capture_failed")
+
+
+def voicemail_from_transcripts(call: Dict[str, Any], transcripts: List[Dict[str, Any]]) -> Optional[Dict[str, str]]:
+    """Caller words to store when no structured tool message exists. No provider calls."""
+    extracted = call.get("extracted_data") or {}
+    existing = extracted.get("save_receptionist_message") if isinstance(extracted, dict) else None
+    if isinstance(existing, dict) and existing:
+        return None
+    caller_lines = [
+        str(entry.get("message", "")).strip()
+        for entry in transcripts
+        if entry.get("speaker") in ("human", "user") and str(entry.get("message", "")).strip()
+    ]
+    if not caller_lines:
+        return None
+    dynamic = call.get("dynamic_vars_applied") or {}
+    caller_number = str(dynamic.get("caller_number") or "") if isinstance(dynamic, dict) else ""
+    if not caller_number:
+        caller_number = str(call.get("phone_number") or "")
+    return {
+        "caller_name": "",
+        "callback_number": caller_number,
+        "reason": " ".join(caller_lines)[:1000],
+        "preferred_contact_time": "",
+        "capture": "voicemail",
+    }
+
+
+def recovery_duration_seconds(call: Dict[str, Any], manual: bool = False) -> Optional[int]:
+    """Seconds to bill when the carrier never sends a terminal callback.
+
+    Automatic recovery waits until the hard cap plus the grace period.
+    The estimate is the hard cap, or the last observed elapsed time when that is
+    higher, and never more than the cap plus the grace period.
+    """
+    started_raw = str(call.get("started_at") or "")
+    try:
+        started = datetime.fromisoformat(started_raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    elapsed = max(0, int((datetime.now(timezone.utc) - started).total_seconds()))
+    limit = settings.MAX_CALL_DURATION_SECONDS
+    grace = settings.STALE_SETTLEMENT_GRACE_SECONDS
+    if elapsed < (limit if manual else limit + grace):
+        return None
+    try:
+        last_known = max(0, int(call.get("duration_seconds") or 0))
+    except (TypeError, ValueError):
+        last_known = 0
+    return min(max(last_known, limit), limit + grace)
+
+
+def apply_call_settlement(call_id: str, duration: int, source: str, carrier_status: Optional[str] = None) -> str:
+    """Settle a reservation once. A later carrier callback adjusts a stale estimate."""
+    if source not in ("carrier", "stale_estimate", "manual"):
+        raise ValueError("Invalid settlement source")
+    ceiling = settings.MAX_CALL_DURATION_SECONDS + settings.STALE_SETTLEMENT_GRACE_SECONDS
+    if duration < 0 or (source != "carrier" and duration > ceiling) or duration > 86400:
+        raise ValueError("Invalid settlement duration")
+    if settings.STAGING and source != "carrier":
+        # Live stale sweeps do not run against the zero staging budget.
+        pass
+    cost = VoiceEngine.calculate_call_cost(int(duration), provider="signalwire")
+    ok, err, outcome = db.release_call_slot(call_id, cost["cost_total"], source=source)
+    if not ok or not outcome:
+        raise RuntimeError(err or "Call settlement unavailable")
+    call = db.get_call(call_id)
+    if outcome == "already_released" or not call:
+        return outcome
+    reservation = db.get_reservation(call_id) or {}
+    authoritative = reservation.get("settlement_source") or source
+    if source != "carrier" and authoritative == "carrier":
+        return outcome
+    status = carrier_status if authoritative == "carrier" else "stale_unsettled"
+    if source == "carrier":
+        status = carrier_status or "completed"
+    db.update_call(call_id, {
+        "status": status,
+        "duration_seconds": int(duration),
+        "ended_at": datetime.now(timezone.utc).isoformat(),
+        "cost_telephony": cost["cost_telephony"],
+        "cost_llm": cost["cost_llm"],
+        "cost_tts": cost["cost_tts"],
+        "cost_total": cost["cost_total"],
+        "settlement_source": authoritative if authoritative == "carrier" else source,
+        "outcome_status": "settled" if authoritative == "carrier" else "stale_unsettled",
+    })
+    if status == "stale_unsettled" and settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN:
+        try:
+            db._upstash_cmd(["ZADD", "apex:stale_calls", str(int(time.time())), call_id])
+            db._upstash_cmd(["ZREMRANGEBYRANK", "apex:stale_calls", "0", "-51"])
+            db._upstash_cmd(["EXPIRE", "apex:stale_calls", str(db.ACCOUNTING_TTL_SECONDS)])
+        except Exception:
+            db.note_ops_error("stale_index_unavailable")
+    return outcome
+
+
+def sweep_stale_reservations(manual_call_id: Optional[str] = None) -> List[Dict[str, str]]:
+    """Settle hosted calls that outlived the carrier callback window. One charge each."""
+    if not (settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN):
+        return []
+    call_ids: List[str] = []
+    if manual_call_id:
+        call_ids.append(manual_call_id)
+    else:
+        holder = db._upstash_cmd(["GET", db.ACTIVE_CALL_KEY])
+        if isinstance(holder, str) and holder:
+            call_ids.append(holder)
+        recent = db._upstash_cmd(["ZREVRANGE", "apex:recent_calls", "0", "49"])
+        if isinstance(recent, list):
+            for item in recent:
+                if isinstance(item, str) and item not in call_ids:
+                    call_ids.append(item)
+    report = []
+    for call_id in call_ids:
+        call = db.get_call(call_id)
+        if not call or call.get("status") not in ("in-progress", "ending", "stale_unsettled"):
+            continue
+        duration = recovery_duration_seconds(call, manual=bool(manual_call_id))
+        if duration is None:
+            continue
+        remember_caller_message(call_id)
+        outcome = apply_call_settlement(call_id, duration, "manual" if manual_call_id else "stale_estimate")
+        report.append({"call_id": call_id, "outcome": outcome, "duration_seconds": str(duration)})
+    return report
 
 
 def staging_cxml_block() -> Optional[str]:
@@ -385,7 +498,7 @@ def handle_signalwire_gather_turn(
 
 def get_sanitized_health_and_settings() -> Dict[str, Any]:
     """Returns strictly non-sensitive readiness flags and operational limits. Never exposes secrets."""
-    return {
+    report = {
         "status": "ok",
         "environment": settings.APEX_ENVIRONMENT,
         "staging": settings.STAGING,
@@ -429,8 +542,14 @@ def get_sanitized_health_and_settings() -> Dict[str, Any]:
         "carrier_termination_configured": bool(
             settings.SIGNALWIRE_PROJECT_ID and settings.SIGNALWIRE_API_TOKEN
         ),
-        "external_deadline_scheduler_configured": bool(settings.CRON_SECRET)
+        "external_deadline_scheduler_configured": bool(settings.CRON_SECRET),
+        "stale_settlement_grace_seconds": settings.STALE_SETTLEMENT_GRACE_SECONDS,
     }
+    if settings.STAGING:
+        configured = bool(settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN)
+        report["redis_configured"] = configured
+        report["redis_reachable"] = db.probe_redis() if configured else False
+    return report
 
 
 def summarize_call(call: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -447,6 +566,7 @@ def summarize_call(call: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         "duration_seconds": call.get("duration_seconds"),
         "outcome_status": call.get("outcome_status"),
         "cost_total": call.get("cost_total"),
+        "settlement_source": call.get("settlement_source"),
     }
 
 
@@ -461,15 +581,37 @@ def sanitize_message(message: Any) -> Dict[str, Any]:
     }
 
 
+def log_ops_failure(section: str, exc: BaseException) -> None:
+    """Write a secret-free line to stderr so Vercel runtime logs show the failure."""
+    text = str(exc).replace("\n", " ")[:300]
+    print(f"[Apex] {section}: {type(exc).__name__}: {text}", file=sys.stderr, flush=True)
+
+
+def redis_configured() -> bool:
+    return bool(settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN)
+
+
 def build_operations_dashboard() -> Dict[str, Any]:
     """Admin-only operations snapshot. Spend is the app estimate, not a carrier invoice."""
     reserve, reserve_error = db._call_reserve_usd()
     unavailable: List[str] = []
+    notices: List[str] = []
     spend = None
+    if os.getenv("VERCEL") and not redis_configured():
+        notices.append(
+            "Shared Redis is not configured. Spend, live calls, and message history stay empty "
+            "until UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN are set."
+        )
+        unavailable.extend(["budget", "calls", "messages", "stale_unsettled"])
+        return _dashboard_payload(
+            reserve, reserve_error, spend, False, False, None, [], [], [], [], notices, unavailable
+        )
     try:
         spend = db.get_monthly_spend()
-    except (RuntimeError, OSError, TypeError, ValueError):
+    except (RuntimeError, OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        log_ops_failure("dashboard budget", exc)
         unavailable.append("budget")
+        notices.append("Spend could not be read. Shared Redis is required on Vercel.")
     paused = False
     scheduler = False
     live = None
@@ -482,8 +624,10 @@ def build_operations_dashboard() -> Dict[str, Any]:
             if isinstance(holder, str) and holder:
                 live = summarize_call(db.get_call(holder)) or {"id": holder, "status": "unknown"}
         recent = [row for row in (summarize_call(call) for call in db.list_recent_calls()) if row]
-    except (RuntimeError, OSError, TypeError, ValueError):
+    except (RuntimeError, OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        log_ops_failure("dashboard calls", exc)
         unavailable.append("calls")
+        notices.append("Recent calls are unavailable without shared Redis.")
     messages: List[Dict[str, Any]] = []
     try:
         for item in db.list_receptionist_messages():
@@ -492,13 +636,29 @@ def build_operations_dashboard() -> Dict[str, Any]:
                 "started_at": item.get("started_at"),
                 "message": sanitize_message(item.get("message")),
             })
-    except (RuntimeError, OSError, TypeError, ValueError, json.JSONDecodeError):
+    except (RuntimeError, OSError, sqlite3.Error, TypeError, ValueError, json.JSONDecodeError) as exc:
+        log_ops_failure("dashboard messages", exc)
         unavailable.append("messages")
+        notices.append("Message history is unavailable without shared Redis.")
     try:
         errors = db.list_ops_errors()
-    except (RuntimeError, OSError, TypeError, ValueError):
+    except (RuntimeError, OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        log_ops_failure("dashboard errors", exc)
         errors = []
         unavailable.append("errors")
+    stale_unsettled: List[Dict[str, Any]] = []
+    try:
+        stale_unsettled = [row for row in (summarize_call(call) for call in db.list_stale_calls()) if row]
+    except (RuntimeError, OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        log_ops_failure("dashboard stale", exc)
+        unavailable.append("stale_unsettled")
+    return _dashboard_payload(
+        reserve, reserve_error, spend, paused, scheduler, live, recent, stale_unsettled,
+        messages, errors, notices, unavailable,
+    )
+
+
+def _dashboard_payload(reserve, reserve_error, spend, paused, scheduler, live, recent, stale_unsettled, messages, errors, notices, unavailable) -> Dict[str, Any]:
     return {
         "environment": settings.APEX_ENVIRONMENT,
         "staging": settings.STAGING,
@@ -516,8 +676,10 @@ def build_operations_dashboard() -> Dict[str, Any]:
         },
         "live_call": live,
         "recent_calls": recent,
+        "stale_unsettled": stale_unsettled,
         "messages": messages,
         "errors": errors,
+        "notices": notices,
         "unavailable": unavailable,
     }
 
@@ -744,7 +906,15 @@ try:
 
     @app.get("/api/dashboard")
     def operations_dashboard(admin=Depends(require_admin)):
-        return JSONResponse(build_operations_dashboard(), headers={"Cache-Control": "private, no-store"})
+        try:
+            payload = build_operations_dashboard()
+        except Exception as exc:
+            log_ops_failure("dashboard", exc)
+            payload = _dashboard_payload(
+                None, "blocked", None, False, False, None, [], [], [], [],
+                ["Operations data could not be loaded."], ["dashboard"],
+            )
+        return JSONResponse(payload, headers={"Cache-Control": "private, no-store"})
 
     @app.post("/api/calls/{call_id}/terminate")
     def terminate_call(call_id: str, admin=Depends(require_admin)):
@@ -950,25 +1120,15 @@ try:
         if settings.STAGING or settings.MONTHLY_BUDGET_LIMIT_USD <= 0:
             return {"status": "ok", "tracked": False, "staging": settings.STAGING}
         remember_caller_message(call_id)
-        cost = VoiceEngine.calculate_call_cost(duration, provider="signalwire")
         try:
             call = db.get_call(call_id)
-            if call:
-                db.update_call(call_id, {
-                    "status": call_status, "duration_seconds": duration,
-                    "ended_at": datetime.now(timezone.utc).isoformat(),
-                    "cost_telephony": cost["cost_telephony"], "cost_llm": cost["cost_llm"],
-                    "cost_tts": cost["cost_tts"], "cost_total": cost["cost_total"]
-                })
-            elif os.getenv("VERCEL"):
-                # SignalWire can send status for a call that Apex explicitly declined.
+            if not call and os.getenv("VERCEL"):
                 if not db._upstash_cmd(["EXISTS", f"apex:acct:{call_id}"]):
                     return {"status": "ok", "tracked": False}
-            if not release_call_slot_safely(call_id, cost["cost_total"]):
-                raise HTTPException(status_code=503, detail="Call settlement unavailable")
-        except (RuntimeError, OSError) as exc:
+            outcome = apply_call_settlement(call_id, duration, "carrier", carrier_status=call_status)
+        except (RuntimeError, OSError, ValueError) as exc:
             raise HTTPException(status_code=503, detail="Call settlement unavailable") from exc
-        return {"status": "ok", "budget_reconciled": True}
+        return {"status": "ok", "budget_reconciled": True, "settlement": outcome}
 
     @app.post("/api/maintenance/enforce-call-duration")
     def enforce_call_duration(request: Request):
@@ -989,7 +1149,8 @@ try:
             requested = False
             if call_id:
                 call = db.get_call(call_id)
-                if not call or call.get("status") not in ("in-progress", "ending"):
+                recoverable = ("in-progress", "ending", "stale_unsettled")
+                if not call or call.get("status") not in recoverable:
                     # A terminal callback can be between recording state and settling the slot.
                     if db._upstash_cmd(["GET", db.ACTIVE_CALL_KEY]) == call_id:
                         raise HTTPException(status_code=503, detail="Active call settlement pending")
@@ -998,15 +1159,23 @@ try:
                     if started.tzinfo is None:
                         started = started.replace(tzinfo=timezone.utc)
                     seconds = max(0, (datetime.now(timezone.utc) - started).total_seconds())
-                    if (paused or seconds >= settings.MAX_CALL_DURATION_SECONDS) and db._upstash_cmd(
-                        ["GET", db.ACTIVE_CALL_KEY]
-                    ) == call_id:
+                    past_grace = seconds >= settings.MAX_CALL_DURATION_SECONDS + settings.STALE_SETTLEMENT_GRACE_SECONDS
+                    still_holding = db._upstash_cmd(["GET", db.ACTIVE_CALL_KEY]) == call_id
+                    # Past the grace window, accounting recovery does not depend on the carrier.
+                    if still_holding and not past_grace and (paused or seconds >= settings.MAX_CALL_DURATION_SECONDS):
                         requested = telephony.terminate_signalwire_call(call_id)
                         if not requested:
                             raise HTTPException(status_code=502, detail="Carrier rejected termination")
+            stale = sweep_stale_reservations()
+            stale_settled = sum(1 for item in stale if item.get("outcome") == "released")
             if db._upstash_cmd(["SET", db.SCHEDULER_KEY, "1", "EX", "180"]) != "OK":
                 raise RuntimeError("Could not verify scheduler heartbeat")
-            return {"checked": True, "active": bool(call_id), "termination_requested": requested}
+            return {
+                "checked": True,
+                "active": bool(call_id),
+                "termination_requested": requested,
+                "stale_settled": stale_settled,
+            }
         except HTTPException:
             raise
         except (RuntimeError, ValueError, TypeError, KeyError) as exc:

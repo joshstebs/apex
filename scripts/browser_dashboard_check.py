@@ -61,6 +61,7 @@ def main():
             page.get_by_role("heading", name="Live call").wait_for()
             page.get_by_role("heading", name="Recent calls").wait_for()
             page.get_by_role("heading", name="Messages").wait_for()
+            page.get_by_role("heading", name="Unsettled calls").wait_for()
             page.get_by_role("heading", name="Errors").wait_for()
             health = page.locator("#health")
             health.get_by_text("receptionist_enabled").wait_for(timeout=10000)

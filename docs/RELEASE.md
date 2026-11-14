@@ -10,7 +10,8 @@ Production routing of the Harbour & Main number is still not approved. Do not ch
 - New hosted admissions require a scheduler heartbeat at `apex:operations:scheduler_at` (about three minutes). `POST /api/maintenance/enforce-call-duration` with `Authorization: Bearer <CRON_SECRET>` writes it and requests carrier hangup when a call is paused or past `MAX_CALL_DURATION_SECONDS`.
 - Speech uses ElevenLabs only after the MP3 is cached. Storage or synthesis failure returns SignalWire `<Say>` instead of a `<Play>` URL that would be silent on HTTP 503.
 - Customer words are stored as `save_receptionist_message`. A model tool call wins. If the model never emits one, the caller's transcript is stored as voicemail when the call ends. Audio recording stays off.
-- `GET /` and `GET /operations` are the operations dashboard. `GET /api/dashboard` requires `Authorization: Bearer <APEX_ADMIN_TOKEN>`.
+- `GET /` and `GET /operations` are the operations dashboard. `GET /api/dashboard` requires `Authorization: Bearer <APEX_ADMIN_TOKEN>`. On Vercel without Redis the dashboard returns HTTP 200 and a notice naming `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`. It does not open SQLite. Failures are printed to stderr as `[Apex] dashboard ...` with the exception type and message only.
+- A hosted call that never receives a terminal status callback is settled once by `POST /api/maintenance/enforce-call-duration` after `MAX_CALL_DURATION_SECONDS` plus `STALE_SETTLEMENT_GRACE_SECONDS` (default 300). The estimate is the hard cap, or the last observed duration if that is higher, and never more than the cap plus the grace period. The call is marked `stale_unsettled`. A later signed carrier callback changes the ledger by the difference and does not add the reserve again. A second carrier callback does not move the ledger. The idempotency record is `apex:settle:<call sid>`.
 - `APEX_ENVIRONMENT=staging` forces a $0 budget, the mock telephony provider, carrier `<Say>`, and a webhook rate limit. That process cannot admit a call or open a carrier HTTP connection.
 
 ## Environment variables
@@ -48,7 +49,7 @@ Names only. Set them in the host's secret store. Never commit values.
 | `MAX_CONCURRENT_CALLS` | Default 1. |
 | `ENFORCE_WEBHOOK_SIGNATURE` | Forced on when `VERCEL` is set. |
 
-There is no database migration. Redis gains these keys when the new code runs: `apex:operations:paused`, `apex:operations:scheduler_at`, `apex:receptionist_messages`, `apex:recent_calls`, `apex:ops:errors`, and `apex:staging:webhook_rate`. Existing `apex:call:*`, `apex:acct:*`, and `apex:spend:*` records stay compatible. Old call state simply has no message index until the next update.
+Local SQLite gains a nullable `calls.settlement_source` column. Startup runs `ALTER TABLE` and ignores the error when the column is already present. Hosted call state is JSON in Redis and needs no migration. Redis gains these keys when the new code runs: `apex:operations:paused`, `apex:operations:scheduler_at`, `apex:receptionist_messages`, `apex:recent_calls`, `apex:stale_calls`, `apex:settle:<call sid>`, `apex:ops:errors`, and `apex:staging:webhook_rate`. Existing `apex:call:*`, `apex:acct:*`, and `apex:spend:*` records stay compatible. Old call state simply has no message index until the next update.
 
 ## Free staging infrastructure
 

@@ -86,9 +86,14 @@ class Database:
                 outcome_status TEXT,
                 extracted_data TEXT,
                 recording_url TEXT,
+                settlement_source TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """)
+            try:
+                cursor.execute("ALTER TABLE calls ADD COLUMN settlement_source TEXT")
+            except sqlite3.OperationalError:
+                pass
 
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS transcripts (
@@ -569,18 +574,73 @@ class Database:
                 return False, "Durable call state unavailable", None
         return True, None, "created"
 
-    def release_call_slot(self, call_id: str, cost_delta: float = 0.0):
-        """Release the call's slot and reconcile the reservation exactly once.
+    def probe_redis(self) -> bool:
+        """Round-trip a nonce. The caller reports only the boolean, never the nonce."""
+        if not (settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN):
+            return False
+        nonce = secrets.token_hex(8)
+        key = "apex:staging:probe"
+        try:
+            self._upstash_cmd(["SET", key, nonce, "EX", "30"])
+            seen = self._upstash_cmd(["GET", key])
+            self._upstash_cmd(["DEL", key])
+        except Exception:
+            return False
+        return seen == nonce
 
-        cost_delta is the expected total incurred cost for the call (not an incremental delta).
-        Returns (ok, error, outcome) where outcome is "released", "already_released", or None.
-        Durable accounting is authoritative; a missing short marker is never treated as success.
-        """
+    def get_reservation(self, call_id: str, ledger: str = "live") -> Optional[Dict[str, Any]]:
+        key = f"apex:acct:{call_id}" if ledger == "live" else f"apex:drill:acct:{call_id}"
+        if not (settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN):
+            return None
+        raw = self._upstash_cmd(["GET", key])
+        if not raw:
+            return None
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    def list_stale_calls(self) -> List[Dict[str, Any]]:
         if settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN:
+            ids = self._upstash_cmd(["ZREVRANGE", "apex:stale_calls", "0", "49"])
+            if not isinstance(ids, list):
+                raise RuntimeError("Stale call index unavailable")
+            calls = []
+            for call_id in ids:
+                if not isinstance(call_id, str):
+                    continue
+                call = self.get_call(call_id)
+                if call and call.get("status") == "stale_unsettled":
+                    calls.append(call)
+            return calls
+        if os.getenv("VERCEL"):
+            return []
+        return [call for call in self.list_calls(50) if call.get("status") == "stale_unsettled"]
+
+    def release_call_slot(self, call_id: str, cost_delta: float = 0.0, source: str = "carrier", ledger: str = "live"):
+        """Reconcile one call's reservation.
+
+        cost_delta is the expected total incurred cost (not an increment).
+        The first settlement replaces the reserve with that total. A later carrier
+        callback may replace a stale or manual estimate with the carrier total.
+        A second carrier settlement does not move the ledger.
+        Returns (ok, error, outcome): released, adjusted, already_released, or None.
+        """
+        if source not in ("carrier", "stale_estimate", "manual"):
+            return False, "Invalid settlement source", None
+        if ledger not in ("live", "drill"):
+            return False, "Invalid settlement ledger", None
+        if ledger == "drill" and not settings.STAGING:
+            return False, "Drill ledger is staging-only", None
+        if settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN:
+            acct_key = f"apex:acct:{call_id}" if ledger == "live" else f"apex:drill:acct:{call_id}"
             try:
-                acct_raw = self._upstash_cmd(["GET", f"apex:acct:{call_id}"])
+                acct_raw = self._upstash_cmd(["GET", acct_key])
             except RuntimeError:
                 return False, "Durable budget/lock store unavailable", None
+            if not acct_raw and ledger == "drill":
+                return False, "Reservation accounting unavailable", None
             if not acct_raw:
                 # Recover accounting only from durable call state. Never guess month/amount.
                 try:
@@ -615,27 +675,57 @@ class Database:
             if not raw then return 0 end
             local decoded, acct = pcall(cjson.decode, raw)
             if not decoded or type(acct) ~= 'table' then return 3 end
-            if acct['reconciled'] == true then return 2 end
-            redis.call('INCRBYFLOAT', KEYS[2], ARGV[2])
+            local source = ARGV[5]
+            local reserve = tonumber(acct['reserve']) or 0
+            local new_cost = tonumber(ARGV[6])
+            if not new_cost then new_cost = reserve + (tonumber(ARGV[2]) or 0) end
+            if new_cost < 0 then return 3 end
+            local function remember(kind)
+              acct['reconciled'] = true
+              acct['reconciled_at'] = ARGV[3]
+              acct['settlement_source'] = kind
+              acct['settled_cost'] = new_cost
+              redis.call('SET', KEYS[3], cjson.encode(acct), 'EX', tonumber(ARGV[4]))
+              redis.call('SET', 'apex:settle:' .. ARGV[1], kind, 'EX', tonumber(ARGV[4]))
+            end
+            if acct['reconciled'] == true then
+              local previous = acct['settlement_source'] or 'carrier'
+              if source == 'carrier' and (previous == 'stale_estimate' or previous == 'manual') then
+                local settled = tonumber(acct['settled_cost'])
+                if not settled then return 3 end
+                redis.call('INCRBYFLOAT', KEYS[2], tostring(new_cost - settled))
+                remember('carrier')
+                return 4
+              end
+              return 2
+            end
+            redis.call('INCRBYFLOAT', KEYS[2], tostring(new_cost - reserve))
             if redis.call('GET', KEYS[1]) == ARGV[1] then redis.call('DEL', KEYS[1]) end
-            acct['reconciled'] = true
-            acct['reconciled_at'] = ARGV[3]
-            redis.call('SET', KEYS[3], cjson.encode(acct), 'EX', tonumber(ARGV[4]))
+            remember(source)
             redis.call('DEL', KEYS[4])
             return 1
             """
+            new_cost = max(0.0, float(cost_delta))
+            if ledger == "live":
+                keys = [self.ACTIVE_CALL_KEY, f"apex:spend:{acct_month}", f"apex:acct:{call_id}", f"apex:reserve:{call_id}"]
+            else:
+                keys = [
+                    f"apex:drill:lock:{call_id}", f"apex:drill:spend:{call_id}",
+                    f"apex:drill:acct:{call_id}", f"apex:drill:reserve:{call_id}",
+                ]
             try:
-                result = self._upstash_cmd(["EVAL", script, "4", "apex:active_call_lock",
-                                            f"apex:spend:{acct_month}", f"apex:acct:{call_id}",
-                                            f"apex:reserve:{call_id}", call_id,
-                                            str(max(0.0, float(cost_delta)) - acct_reserve),
-                                            datetime.utcnow().isoformat(), str(self.ACCOUNTING_TTL_SECONDS)])
+                result = self._upstash_cmd(["EVAL", script, "4", *keys, call_id,
+                                            str(new_cost - acct_reserve),
+                                            datetime.utcnow().isoformat(), str(self.ACCOUNTING_TTL_SECONDS),
+                                            source, str(new_cost)])
             except RuntimeError:
                 return False, "Durable budget/lock store unavailable", None
             if result == 1:
                 return True, None, "released"
             if result == 2:
                 return True, None, "already_released"
+            if result == 4:
+                return True, None, "adjusted"
             if result == 3:
                 return False, "Reservation accounting corrupt", None
             # Accounting disappeared between read and EVAL; do not guess success.
@@ -868,7 +958,10 @@ class Database:
 
     def update_call(self, call_id: str, updates: Dict[str, Any]):
         if os.getenv("VERCEL"):
-            allowed = {"status", "ended_at", "duration_seconds", "cost_telephony", "cost_llm", "cost_tts", "cost_total", "extracted_data", "outcome_status"}
+            allowed = {
+                "status", "ended_at", "duration_seconds", "cost_telephony", "cost_llm",
+                "cost_tts", "cost_total", "extracted_data", "outcome_status", "settlement_source",
+            }
             if set(updates) - allowed:
                 raise ValueError("Invalid call update field")
             self._atomic_update_state(call_id, updates=updates)
@@ -1012,6 +1105,10 @@ class Database:
             spend_raw = self._upstash_cmd(["GET", f"apex:spend:{month_key}"])
             if spend_raw is not None:
                 return round(float(spend_raw), 4)
+        # Vercel skips local schema creation and the project disk is read-only.
+        # Do not open SQLite there; the caller shows an empty spend instead of HTTP 500.
+        if os.getenv("VERCEL"):
+            raise RuntimeError("Shared Redis is not configured")
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT COALESCE(SUM(cost_total), 0.0) as total FROM calls")
