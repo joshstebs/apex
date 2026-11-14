@@ -8,14 +8,17 @@ settings.UPSTASH_REDIS_REST_URL='https://mock.invalid'
 settings.UPSTASH_REDIS_REST_TOKEN='test-only'
 settings.SIGNALWIRE_SIGNING_KEY='test-signature-key'
 settings.ENFORCE_WEBHOOK_SIGNATURE=True
+settings.CRON_SECRET = 'fixture-scheduler'
 settings.RECEPTIONIST_ENABLED=True
 # Test-only provider presence flags; no live API calls are made.
 settings.ELEVENLABS_API_KEY="test-only"
 settings.HUGGINGFACE_API_KEY="test-only"
 settings.PUBLIC_URL="https://example.vercel.app"
-redis={}
+redis={db.SCHEDULER_KEY: "1"}
 def cmd(c):
     op=c[0].upper()
+    if op == 'EXISTS':
+        return int(c[1] in redis)
     if op=='GET':return redis.get(c[1])
     if op=='SET':
         if 'NX' in c and c[1] in redis:return None
@@ -23,8 +26,12 @@ def cmd(c):
     if op=='EVAL':
         script=c[1]
         if 'local lock = redis.call' in script and 'KEYS[5]' in script:
-            lock,spend,marker,acct,state=c[3:8]
-            call,lock_ttl,marker_ttl,reserve,budget,acct_json,acct_ttl=c[8:]
+            lock, spend, marker, acct, state, pause, scheduler = c[3:10]
+            call,lock_ttl,marker_ttl,reserve,budget,acct_json,acct_ttl=c[10:]
+            if pause in redis:
+                return 6
+            if lock_ttl == "0" and scheduler not in redis:
+                return 7
             if redis.get(lock)==call:
                 if acct in redis or marker in redis:return 2
                 return 3

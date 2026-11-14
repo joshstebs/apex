@@ -63,14 +63,15 @@ an existing business number here before this verification.
 - Gather follow-up (POST, generated automatically by cXML): `/webhooks/signalwire/gather`
 - Status callback (POST): `/webhooks/signalwire/status`
 - Protected manual hangup: `POST /api/calls/{call_id}/terminate` (bearer admin token)
-- Optional duration watchdog: `POST /api/maintenance/enforce-call-duration`
+- Required Vercel inbound duration watchdog: `POST /api/maintenance/enforce-call-duration`
   (bearer `CRON_SECRET`, requires an **external scheduler at least once a minute**).
 
-A successful hangup request is not the same as a confirmed hangup. The carrier
-status callback must be checked and invoices reconciled. An external 60-second
-watchdog is **not** an exact 20-minute cutoff; with a failed callback or scheduler,
-the call can exceed 20 minutes. Vercel Hobby cron cannot run every minute.
-Do not activate live routing until carrier-enforced duration and usage tests pass.
+The watchdog writes a three-minute heartbeat after a successful check. New Vercel
+calls require the heartbeat and a valid budget reservation. Once admitted, a call
+owns the slot until a signed terminal callback settles its reservation. A missing
+callback holds the slot closed. The one-minute scheduler cadence and upstream
+latency affect when an overdue hangup request is sent. Verify the carrier's own
+duration and spending controls using the test number before enabling business routing.
 
 
 ## Purchased SignalWire test number (October 29, 2026)
@@ -116,3 +117,47 @@ The project uses Vercel's native FastAPI detection of root `app.py`.
 Do not add a catch-all rewrite to `/api/index`, which causes FastAPI to receive
 an incorrect path and return HTTP 404 for the main application. The standalone
 `api/index.py` is retained as a legacy compatibility entrypoint only.
+
+### Command Center pause control
+
+Set a dedicated `APEX_OPERATIONS_TOKEN` before staging the operations endpoints. The token
+must be at least 32 characters and differ from `APEX_ADMIN_TOKEN`. Where Vercel and Upstash
+are configured, `GET /api/operations` returns a Redis admission estimate and scheduler heartbeat.
+`POST /api/operations/pause` atomically sets `apex:operations:paused` and reads the active-call
+slot. It then requests carrier termination when a slot is occupied. Carrier acceptance is
+reported separately, and signed status callbacks still reconcile costs. A provider request
+already dispatched can run to completion.
+
+To restore service, first verify the carrier has ended any active call and resolve the incident.
+Then remove only the `apex:operations:paused` key in the correct Upstash database. The application
+still requires its normal inbound configuration and budget eligibility. Use the provider consoles
+for actual billing and provider-side caps. The scheduled enforcer heartbeat expires after three
+minutes and indicates an authenticated check-in.
+
+
+### Staging verification and recovery
+
+1. Use the SignalWire test number and a separate Redis database for staging. Set
+   the signed voice, gather and status callbacks to the same staging origin, and
+   configure the provider credentials there. Set `RECEPTIONIST_ENABLED=false` until
+   the scheduler can authenticate and `/api/operations` reports a recent heartbeat.
+2. Run the enforcer every minute from the staging host. Send a POST to
+   `/api/maintenance/enforce-call-duration` with `Authorization: Bearer <CRON_SECRET>`.
+   Keep that header in a mode-0600 curl config file or the scheduler's secret store.
+   Treat non-2xx responses as failed runs. Use a stable host that the carrier can
+   reach without browser login.
+3. On the test number, verify valid and invalid signatures, a normal hangup and its
+   terminal callback, and scheduler termination with a short staging duration. Verify
+   the Redis reservation remains held until the terminal callback, and duplicate
+   callbacks do not charge the budget twice. Disable the staging scheduler long
+   enough for its heartbeat to expire and verify that new inbound calls are declined.
+4. If a slot remains held, pause call handling, inspect the carrier's call record and
+   recover the signed terminal callback or settle the reservation against the verified
+   duration. Keep the slot held until the carrier has confirmed the call ended.
+   Check provider billing independently of the application's estimated monthly ledger.
+   Before rolling back to a release with an expiring call lock, pause inbound handling
+   and confirm the slot is empty.
+
+Run `python -m compileall -q .` and the `test_*.py` scripts locally. The lifecycle
+integration test starts its own loopback Redis process and requires `redis-server`
+and `redis-cli`. It uses signed callback fixtures and stubs carrier termination.

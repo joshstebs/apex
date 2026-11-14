@@ -13,11 +13,12 @@ import glob
 import json
 import uuid
 import hmac
+import math
 import urllib.parse
 import base64
 import time
 from typing import Dict, Any, List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 from config import settings
 from database import Database
@@ -98,7 +99,7 @@ def handle_signalwire_inbound_or_connect(
         )
     # Production calls must never proceed in an unconfigured text-only/silent demo.
     if os.getenv("VERCEL") and not (
-        settings.get_webhook_signing_key()
+        settings.CRON_SECRET and settings.get_webhook_signing_key()
         and settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN
         and settings.ELEVENLABS_API_KEY and settings.HUGGINGFACE_API_KEY
         and settings.PUBLIC_URL.startswith("https://")
@@ -163,6 +164,16 @@ def handle_signalwire_inbound_or_connect(
         clip_id=clip_id
     )
 
+def end_from_gather(call_id: str, local_cost: float) -> None:
+    if os.getenv("VERCEL"):
+        # Hangup cXML is an instruction to the carrier. Keep the reservation in
+        # place until the signed terminal callback reports the billed duration.
+        db.mark_call_ending(call_id)
+    else:
+        db.update_call(call_id, {"status": "completed", "ended_at": datetime.now(timezone.utc).isoformat()})
+        release_call_slot_safely(call_id, local_cost)
+
+
 def handle_signalwire_gather_turn(
     params: Dict[str, str],
     query_params: Dict[str, str]
@@ -182,12 +193,13 @@ def handle_signalwire_gather_turn(
     if not call:
         return telephony.build_signalwire_cxml_hangup("Thank you for calling. Goodbye!")
     if os.getenv("VERCEL"):
-        holder = db._upstash_cmd(["GET", "apex:active_call_lock"])
+        if db._upstash_cmd(["EXISTS", db.CALL_PAUSE_KEY]):
+            return telephony.build_signalwire_cxml_hangup("This line is temporarily unavailable. Goodbye.")
+        holder = db._upstash_cmd(["GET", db.ACTIVE_CALL_KEY])
         if holder != call_id or call.get("status") != "in-progress":
             return telephony.build_signalwire_cxml_hangup("This call session has ended. Goodbye.")
 
-    # Enforce configured duration at the next webhook turn (not carrier-side termination)
-    from datetime import timezone
+    # Carrier termination and final settlement are handled independently of this turn.
     try:
         started = datetime.fromisoformat(call["started_at"].replace("Z", "+00:00"))
         if started.tzinfo is None:
@@ -197,21 +209,13 @@ def handle_signalwire_gather_turn(
         return telephony.build_signalwire_cxml_hangup("Unable to verify call duration. Goodbye.")
     if new_duration >= settings.MAX_CALL_DURATION_SECONDS:
         cost_info = VoiceEngine.calculate_call_cost(settings.MAX_CALL_DURATION_SECONDS, provider="signalwire")
-        db.update_call(call_id, {
-            "status": "completed",
-            "duration_seconds": settings.MAX_CALL_DURATION_SECONDS,
-            "ended_at": datetime.utcnow().isoformat(),
-            "cost_total": cost_info["cost_total"]
-        })
-        # release_call_slot expects expected TOTAL incurred cost, not an incremental delta.
-        release_call_slot_safely(call_id, cost_info["cost_total"])
+        end_from_gather(call_id, cost_info["cost_total"])
         return telephony.build_signalwire_cxml_hangup(
             f"We have reached our {settings.MAX_CALL_DURATION_SECONDS // 60} minute call time limit. Thank you and goodbye!"
         )
 
     if not user_input:
-        db.update_call(call_id, {"status": "completed", "ended_at": datetime.utcnow().isoformat()})
-        release_call_slot_safely(call_id, 0.0)
+        end_from_gather(call_id, 0.0)
         return telephony.build_signalwire_cxml_hangup("I didn't hear anything. Goodbye!")
 
     ast = db.get_assistant(call.get("assistant_id") or assistant_id)
@@ -265,8 +269,7 @@ def handle_signalwire_gather_turn(
         clip_id = db.create_tts_clip(reply_text, voice_id=ast.get("voice_id") or settings.ELEVENLABS_DEFAULT_VOICE_ID)
 
     if any(p in user_input.lower() for p in ["goodbye", "bye", "that's all", "hang up"]):
-        db.update_call(call_id, {"status": "completed", "ended_at": datetime.utcnow().isoformat()})
-        release_call_slot_safely(call_id, cost_info["cost_total"])
+        end_from_gather(call_id, cost_info["cost_total"])
         return telephony.build_signalwire_cxml_hangup(reply_text, clip_id=clip_id)
 
     return telephony.build_signalwire_cxml_gather(
@@ -326,6 +329,7 @@ def get_sanitized_health_and_settings() -> Dict[str, Any]:
 # =========================================================================
 try:
     from fastapi import FastAPI, Request, HTTPException
+    from starlette.concurrency import run_in_threadpool
     from fastapi.responses import HTMLResponse, JSONResponse, Response
     from fastapi.middleware.cors import CORSMiddleware
     from pydantic import BaseModel
@@ -381,6 +385,57 @@ try:
     @app.get("/api/health")
     def health_check():
         return get_sanitized_health_and_settings()
+
+    def require_operations(credentials: HTTPAuthorizationCredentials = Depends(bearer)):
+        token = os.getenv("APEX_OPERATIONS_TOKEN", "")
+        admin = os.getenv("APEX_ADMIN_TOKEN", "")
+        if len(token) < 32 or token == admin or not credentials or not hmac.compare_digest(
+            credentials.credentials.encode(), token.encode()
+        ):
+            raise HTTPException(status_code=401, detail="Operations authentication required")
+        if not os.getenv("VERCEL") or settings.durable_storage_backend() != "upstash_redis":
+            raise HTTPException(status_code=503, detail="Durable call control unavailable")
+
+    @app.get("/api/operations", dependencies=[Depends(require_operations)])
+    def operations_status(response: Response):
+        month = datetime.now(timezone.utc).strftime("%Y-%m")
+        try:
+            paused, spend, scheduler_at = db._upstash_cmd([
+                "MGET", db.CALL_PAUSE_KEY, f"apex:spend:{month}", db.SCHEDULER_KEY
+            ])
+            estimated = float(spend) if spend is not None else 0.0
+            if not math.isfinite(estimated) or estimated < 0 or db._call_reserve_usd()[1]:
+                raise ValueError("Invalid spend")
+        except (RuntimeError, TypeError, ValueError) as exc:
+            raise HTTPException(status_code=503, detail="Operations state unavailable") from exc
+        flags = get_sanitized_health_and_settings()
+        response.headers["Cache-Control"] = "no-store"
+        return {
+            "paused": paused is not None,
+            "estimatedSpendUsd": estimated,
+            "budgetUsd": flags["monthly_budget_limit_usd"],
+            "schedulerRecentlySeen": bool(scheduler_at),
+            "carrierBillingCapVerified": None
+        }
+
+    @app.post("/api/operations/pause", dependencies=[Depends(require_operations)])
+    def pause_calls(response: Response):
+        # Set the flag and capture the active slot atomically with respect to admission.
+        try:
+            call_id = db._upstash_cmd([
+                "EVAL", "redis.call('SET', KEYS[1], '1'); return redis.call('GET', KEYS[2])",
+                "2", db.CALL_PAUSE_KEY, db.ACTIVE_CALL_KEY
+            ])
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail="Could not verify the pause") from exc
+        carrier = "no_active_call"
+        if call_id:
+            try:
+                carrier = "requested" if telephony.terminate_signalwire_call(call_id) else "unconfirmed"
+            except (RuntimeError, ValueError, OSError):
+                carrier = "unconfirmed"
+        response.headers["Cache-Control"] = "no-store"
+        return {"paused": True, "carrierTermination": carrier}
 
     @app.get("/api/settings")
     def get_settings():
@@ -484,9 +539,9 @@ try:
                 raise HTTPException(status_code=404, detail="Call not found")
             if c.get("provider") != "signalwire" or c.get("direction") != "inbound":
                 raise HTTPException(status_code=400, detail="Only inbound SignalWire calls can be terminated")
-            if c.get("status") != "in-progress":
+            if c.get("status") not in ("in-progress", "ending"):
                 raise HTTPException(status_code=409, detail="Call is no longer active")
-            if db._upstash_cmd(["GET", "apex:active_call_lock"]) != call_id:
+            if db._upstash_cmd(["GET", db.ACTIVE_CALL_KEY]) != call_id:
                 raise HTTPException(status_code=409, detail="Call no longer owns the active slot")
             try:
                 requested = telephony.terminate_signalwire_call(call_id)
@@ -580,6 +635,12 @@ try:
         Serves ElevenLabs audio using a short-lived opaque clip_id backed by temporary storage.
         Zero conversation text is ever exposed in URLs.
         """
+        if os.getenv("VERCEL"):
+            try:
+                if db._upstash_cmd(["EXISTS", db.CALL_PAUSE_KEY]):
+                    raise HTTPException(status_code=503, detail="Call handling is paused")
+            except RuntimeError as exc:
+                raise HTTPException(status_code=503, detail="Call state unavailable") from exc
         clip = db.get_tts_clip(clip_id)
         if not clip:
             raise HTTPException(status_code=404, detail="Audio clip expired or not found")
@@ -623,7 +684,7 @@ try:
 
         query_params = dict(request.query_params)
         try:
-            cxml = handle_signalwire_inbound_or_connect(params, query_params)
+            cxml = await run_in_threadpool(handle_signalwire_inbound_or_connect, params, query_params)
         except (RuntimeError, OSError):
             cxml = telephony.build_signalwire_cxml_hangup("This line is temporarily unavailable. Please try again later.")
         return Response(content=cxml, media_type="application/xml")
@@ -638,7 +699,7 @@ try:
 
         query_params = dict(request.query_params)
         try:
-            cxml = handle_signalwire_gather_turn(params, query_params)
+            cxml = await run_in_threadpool(handle_signalwire_gather_turn, params, query_params)
         except (RuntimeError, OSError):
             cxml = telephony.build_signalwire_cxml_hangup(
                 "This line is temporarily unavailable. Please try again later."
@@ -653,54 +714,82 @@ try:
         if not telephony.verify_signalwire_webhook(pub_url, params, raw_body, dict(request.headers)):
             raise HTTPException(status_code=403, detail="Invalid SignalWire webhook signature")
 
-        call_id = params.get("CallSid") or request.query_params.get("call_id")
-        call_status = params.get("CallStatus", "completed")
+        call_id = params.get("CallSid")
+        call_status = params.get("CallStatus", "")
+        if call_status not in ("completed", "busy", "no-answer", "failed", "canceled"):
+            return {"status": "ok"}
+        if not call_id:
+            raise HTTPException(status_code=400, detail="Missing carrier call ID")
         try:
-            duration = max(0, int(params.get("CallDuration", "0") or 0))
-        except (TypeError, ValueError):
-            duration = 0
-        if call_id and call_status in ("completed", "busy", "no-answer", "failed", "canceled"):
-            cost_info = VoiceEngine.calculate_call_cost(duration, provider="signalwire")
-            db.update_call(call_id, {
-                "status": "completed" if call_status == "completed" else call_status,
-                "duration_seconds": duration,
-                "ended_at": datetime.utcnow().isoformat(),
-                "cost_telephony": cost_info["cost_telephony"],
-                "cost_llm": cost_info["cost_llm"],
-                "cost_tts": cost_info["cost_tts"],
-                "cost_total": cost_info["cost_total"]
-            })
-            reconciled = release_call_slot_safely(call_id, cost_info["cost_total"])
-            return {"status": "ok", "budget_reconciled": reconciled}
-        return {"status": "ok"}
+            raw_duration = params.get("CallDuration")
+            if raw_duration is None and call_status != "completed":
+                raw_duration = "0"
+            if not raw_duration or not raw_duration.isascii() or not raw_duration.isdecimal() or len(raw_duration) > 9:
+                raise ValueError("Invalid carrier duration")
+            duration = int(raw_duration)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid carrier duration") from exc
+
+        return await run_in_threadpool(settle_signalwire_call, call_id, call_status, duration)
+
+    def settle_signalwire_call(call_id: str, call_status: str, duration: int):
+        cost = VoiceEngine.calculate_call_cost(duration, provider="signalwire")
+        try:
+            call = db.get_call(call_id)
+            if call:
+                db.update_call(call_id, {
+                    "status": call_status, "duration_seconds": duration,
+                    "ended_at": datetime.now(timezone.utc).isoformat(),
+                    "cost_telephony": cost["cost_telephony"], "cost_llm": cost["cost_llm"],
+                    "cost_tts": cost["cost_tts"], "cost_total": cost["cost_total"]
+                })
+            elif os.getenv("VERCEL"):
+                # SignalWire can send status for a call that Apex explicitly declined.
+                if not db._upstash_cmd(["EXISTS", f"apex:acct:{call_id}"]):
+                    return {"status": "ok", "tracked": False}
+            if not release_call_slot_safely(call_id, cost["cost_total"]):
+                raise HTTPException(status_code=503, detail="Call settlement unavailable")
+        except (RuntimeError, OSError) as exc:
+            raise HTTPException(status_code=503, detail="Call settlement unavailable") from exc
+        return {"status": "ok", "budget_reconciled": True}
 
     @app.post("/api/maintenance/enforce-call-duration")
     def enforce_call_duration(request: Request):
-        # Requires an external, trusted minute-level scheduler. Not enabled by default.
         secret = settings.CRON_SECRET
         authorization = request.headers.get("authorization", "")
-        if not secret or not hmac.compare_digest(authorization, f"Bearer {secret}"):
+        if not secret or not hmac.compare_digest(authorization.encode(), f"Bearer {secret}".encode()):
             raise HTTPException(status_code=401, detail="Unauthorized")
         if not os.getenv("VERCEL") or settings.durable_storage_backend() != "upstash_redis":
             raise HTTPException(status_code=503, detail="Durable carrier enforcement unavailable")
         try:
-            call_id = db._upstash_cmd(["GET", "apex:active_call_lock"])
-            if not call_id:
-                return {"checked": True, "active": False, "termination_requested": False}
-            call = db.get_call(call_id)
-            if not call or call.get("status") != "in-progress":
-                raise HTTPException(status_code=503, detail="Active call state unavailable")
-            from datetime import timezone
-            started = datetime.fromisoformat(call["started_at"].replace("Z", "+00:00"))
-            if started.tzinfo is None:
-                started = started.replace(tzinfo=timezone.utc)
-            seconds = max(0, (datetime.now(timezone.utc) - started).total_seconds())
-            if seconds < settings.MAX_CALL_DURATION_SECONDS:
-                return {"checked": True, "active": True, "termination_requested": False}
-            accepted = telephony.terminate_signalwire_call(call_id)
-            if not accepted:
-                raise HTTPException(status_code=502, detail="Carrier rejected termination")
-            return {"checked": True, "active": True, "termination_requested": True}
+            # Preserve any legacy leased slot before it expires while a call is active.
+            call_id, paused = db._upstash_cmd([
+                "EVAL",
+                "local id = redis.call('GET', KEYS[1]); if id then redis.call('PERSIST', KEYS[1]) end; "
+                "return {id or false, redis.call('EXISTS', KEYS[2])}",
+                "2", db.ACTIVE_CALL_KEY, db.CALL_PAUSE_KEY
+            ])
+            requested = False
+            if call_id:
+                call = db.get_call(call_id)
+                if not call or call.get("status") not in ("in-progress", "ending"):
+                    # A terminal callback can be between recording state and settling the slot.
+                    if db._upstash_cmd(["GET", db.ACTIVE_CALL_KEY]) == call_id:
+                        raise HTTPException(status_code=503, detail="Active call settlement pending")
+                else:
+                    started = datetime.fromisoformat(call["started_at"].replace("Z", "+00:00"))
+                    if started.tzinfo is None:
+                        started = started.replace(tzinfo=timezone.utc)
+                    seconds = max(0, (datetime.now(timezone.utc) - started).total_seconds())
+                    if (paused or seconds >= settings.MAX_CALL_DURATION_SECONDS) and db._upstash_cmd(
+                        ["GET", db.ACTIVE_CALL_KEY]
+                    ) == call_id:
+                        requested = telephony.terminate_signalwire_call(call_id)
+                        if not requested:
+                            raise HTTPException(status_code=502, detail="Carrier rejected termination")
+            if db._upstash_cmd(["SET", db.SCHEDULER_KEY, "1", "EX", "180"]) != "OK":
+                raise RuntimeError("Could not verify scheduler heartbeat")
+            return {"checked": True, "active": bool(call_id), "termination_requested": requested}
         except HTTPException:
             raise
         except (RuntimeError, ValueError, TypeError, KeyError) as exc:
