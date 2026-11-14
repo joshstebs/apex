@@ -10,6 +10,7 @@ ApexVoice AI: Vercel-Ready Autonomous Telephony Platform
 """
 import os
 import sqlite3
+import re
 import glob
 import json
 import uuid
@@ -73,11 +74,12 @@ def reconstruct_public_webhook_url(request_url_str: str, headers: Dict[str, str]
 
 def build_conversation_history(transcripts: List[Dict[str, Any]]) -> List[Dict[str, str]]:
     roles = {"assistant": "assistant", "human": "user", "user": "user"}
-    return [
+    conversation = [
         {"role": roles[entry["speaker"]], "content": entry["message"]}
         for entry in transcripts
         if entry["speaker"] in roles
     ]
+    return conversation[-16:]
 
 
 def create_voice_clip(spoken_text: str, voice_id: Optional[str]) -> Optional[str]:
@@ -235,7 +237,9 @@ def handle_signalwire_gather_turn(
 
     ast = db.get_assistant(call.get("assistant_id") or assistant_id)
     if not ast:
-        ast = db.list_assistants()[0]
+        return telephony.build_signalwire_cxml_hangup(
+            "The receptionist is temporarily unavailable. Please contact the business directly."
+        )
 
     # Redis state is authoritative across Vercel instances.
     conv_history = build_conversation_history(db.get_call_transcripts(call_id))
@@ -275,7 +279,8 @@ def handle_signalwire_gather_turn(
 
     clip_id = create_voice_clip(reply_text, ast.get("voice_id"))
 
-    if any(p in user_input.lower() for p in ["goodbye", "bye", "that's all", "hang up"]):
+    closing_request = re.sub(r"[^\w\s']", "", user_input.casefold().replace("’", "'")).strip()
+    if closing_request in {"goodbye", "bye", "that's all", "hang up", "thanks goodbye", "thank you goodbye"}:
         db.update_call(call_id, {"status": "completed", "ended_at": datetime.utcnow().isoformat()})
         release_call_slot_safely(call_id, cost_info["cost_total"])
         return telephony.build_signalwire_cxml_hangup(reply_text, clip_id=clip_id)

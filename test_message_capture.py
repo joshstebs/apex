@@ -39,6 +39,10 @@ def run():
         {"role": "user", "content": "I need a callback."},
     ]
 
+    long_history = [{"speaker": "human", "message": str(turn)} for turn in range(20)]
+    recent = build_conversation_history(long_history)
+    assert [entry["content"] for entry in recent] == [str(turn) for turn in range(4, 20)]
+
 
 if __name__ == "__main__":
     run()

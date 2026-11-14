@@ -26,7 +26,7 @@ def run():
         patch.object(settings, "UPSTASH_REDIS_REST_TOKEN", "test"),
         patch.object(settings, "SIGNALWIRE_SIGNING_KEY", "test"),
         patch.object(voice_engine, "elevenlabs_key", "test"),
-        patch.object(db, "get_assistant", return_value=assistant),
+        patch.object(db, "get_assistant", return_value=assistant) as get_assistant,
         patch.object(db, "get_call", return_value=call),
         patch.object(db, "_upstash_cmd", return_value=call_id),
         patch.object(db, "try_acquire_call_slot", return_value=(True, None, "admitted")),
@@ -44,6 +44,22 @@ def run():
         goodbye = ElementTree.fromstring(handle_signalwire_gather_turn({**params, "SpeechResult": "Goodbye"}, {}))
         assert goodbye.findtext("Say") == reply["text"]
         assert goodbye.find("Hangup") is not None
+
+        for speech in ("My name is Byers", "That’s all I know about the issue"):
+            continuing = ElementTree.fromstring(
+                handle_signalwire_gather_turn({**params, "SpeechResult": speech}, {})
+            )
+            assert continuing.find("Gather") is not None
+
+        get_assistant.return_value = None
+        with patch.object(db, "list_assistants") as list_assistants:
+            unavailable = ElementTree.fromstring(
+                handle_signalwire_gather_turn({**params, "SpeechResult": "Hello"}, {})
+            )
+            assert unavailable.find("Gather") is None
+            assert unavailable.find("Hangup") is not None
+            list_assistants.assert_not_called()
+        get_assistant.return_value = assistant
 
         create_clip.side_effect = None
         create_clip.return_value = "clip_opaque"
