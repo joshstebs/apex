@@ -7,6 +7,7 @@ Supports:
 """
 import sqlite3
 import json
+import math
 import time
 import secrets
 import os
@@ -20,6 +21,8 @@ class Database:
     # Durable accounting outlives the short marker and 24h call-state TTL.
     ACCOUNTING_TTL_SECONDS = 604800
     CALL_PAUSE_KEY = "apex:operations:paused"
+    ACTIVE_CALL_KEY = "apex:active_call_lock"
+    SCHEDULER_KEY = "apex:operations:scheduler_at"
 
     def __init__(self, db_path: str = None):
         self.db_path = db_path or settings.DB_PATH
@@ -262,7 +265,8 @@ class Database:
         except (TypeError, ValueError):
             return None, "Invalid call budget reservation"
         # Fail closed if a full-duration call cannot fit the configured budget reserve.
-        if reserve <= 0 or reserve > settings.MONTHLY_BUDGET_LIMIT_USD:
+        budget = settings.MONTHLY_BUDGET_LIMIT_USD
+        if not math.isfinite(reserve) or not math.isfinite(budget) or not 0 < reserve <= budget:
             return None, "Invalid call budget reservation"
         return reserve, None
 
@@ -290,12 +294,33 @@ class Database:
             state_payload = {"call": call_record, "transcripts": [], "accounting": accounting}
             marker_ttl = str(settings.MAX_CALL_DURATION_SECONDS + 60)
             acct_ttl = str(self.ACCOUNTING_TTL_SECONDS)
-            # KEYS: 1=active call lock, 2=current-month spend, 3=short marker, 4=durable accounting, 5=durable call state
+            hosted = bool(os.getenv("VERCEL"))
+            # Hosted calls keep their slot until carrier confirmation. A legacy lease can
+            # be made durable on replay or by the scheduler before it expires.
+            # KEYS: slot, spend, short marker, accounting, call state, pause, scheduler
             script = """
             if redis.call('EXISTS', KEYS[6]) == 1 then return 6 end
             local lock = redis.call('GET', KEYS[1])
+            local hosted = ARGV[2] == '0'
+            if hosted and redis.call('EXISTS', KEYS[7]) == 0 then return 7 end
+            local function hold_slot()
+              if hosted then
+                redis.call('SET', KEYS[1], ARGV[1])
+              else
+                redis.call('SET', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[2]))
+              end
+            end
             if lock == ARGV[1] then
-              if redis.call('EXISTS', KEYS[4]) == 1 or redis.call('EXISTS', KEYS[3]) == 1 then return 2 end
+              local tracked = redis.call('GET', KEYS[5])
+              if tracked then
+                local valid, saved = pcall(cjson.decode, tracked)
+                if not valid or type(saved) ~= 'table' or type(saved.call) ~= 'table'
+                   or saved.call.status ~= 'in-progress' then return 5 end
+              end
+              if redis.call('EXISTS', KEYS[4]) == 1 or redis.call('EXISTS', KEYS[3]) == 1 then
+                if hosted then redis.call('PERSIST', KEYS[1]) end
+                return 2
+              end
               return 3
             end
             if lock then return 0 end
@@ -309,7 +334,7 @@ class Database:
                   if acct_raw then
                     local acct_ok, acct = pcall(cjson.decode, acct_raw)
                     if not acct_ok or type(acct) ~= 'table' or acct['reconciled'] == true then return 5 end
-                    redis.call('SET', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[2]))
+                    hold_slot()
                     redis.call('SET', KEYS[3], acct_raw, 'EX', tonumber(ARGV[3]))
                     return 4
                   end
@@ -325,7 +350,7 @@ class Database:
                       if not racing_ok or type(racing_acct) ~= 'table' or racing_acct['reconciled'] == true then return 5 end
                       chosen = racing
                     end
-                    redis.call('SET', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[2]))
+                    hold_slot()
                     redis.call('SET', KEYS[3], chosen, 'EX', tonumber(ARGV[3]))
                     return 4
                   end
@@ -336,22 +361,24 @@ class Database:
             end
             if redis.call('EXISTS', KEYS[4]) == 1 then return 5 end
             local spent = tonumber(redis.call('GET', KEYS[2]) or '0')
-            if spent + tonumber(ARGV[4]) > tonumber(ARGV[5]) then return 0 end
-            redis.call('SET', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[2]))
+            if not spent or spent < 0 or spent + tonumber(ARGV[4]) > tonumber(ARGV[5]) then return 0 end
             redis.call('INCRBYFLOAT', KEYS[2], ARGV[4])
+            hold_slot()
             redis.call('SET', KEYS[3], ARGV[6], 'EX', tonumber(ARGV[3]))
             redis.call('SET', KEYS[4], ARGV[6], 'EX', tonumber(ARGV[7]))
             return 1
             """
             try:
-                ok = self._upstash_cmd(["EVAL", script, "6", "apex:active_call_lock",
+                ok = self._upstash_cmd(["EVAL", script, "7", self.ACTIVE_CALL_KEY,
                                         f"apex:spend:{month_key}", f"apex:reserve:{call_id}",
-                                        f"apex:acct:{call_id}", f"apex:call:{call_id}", self.CALL_PAUSE_KEY, call_id,
-                                        str(settings.MAX_CALL_DURATION_SECONDS + 15),
+                                        f"apex:acct:{call_id}", f"apex:call:{call_id}", self.CALL_PAUSE_KEY, self.SCHEDULER_KEY,
+                                        call_id, "0" if hosted else str(settings.MAX_CALL_DURATION_SECONDS + 15),
                                         marker_ttl, str(reserve), str(settings.MONTHLY_BUDGET_LIMIT_USD),
                                         accounting_value, acct_ttl])
             except RuntimeError:
                 return False, "Durable budget/lock store unavailable", None
+            if ok == 7:
+                return False, "Call deadline scheduler unavailable", None
             if ok == 6:
                 return False, "Call handling is paused", "paused"
             if ok == 0:
@@ -386,7 +413,8 @@ class Database:
             if ok == 4:
                 # Lock was lost while the call remained active: reacquired without charging again.
                 return True, None, "replay"
-            # ok == 1: fresh reservation.
+            if ok != 1:
+                return False, "Durable admission could not be verified", None
 
         if os.getenv("VERCEL"):
             try:
@@ -490,7 +518,9 @@ class Database:
                 acct_reserve = float(accounting["reserve"])
             except (TypeError, ValueError, KeyError):
                 return False, "Reservation accounting corrupt", None
-            if acct_month.count("-") != 1 or len(acct_month) != 7:
+            if (acct_month.count("-") != 1 or len(acct_month) != 7
+                    or not math.isfinite(acct_reserve) or acct_reserve < 0
+                    or not math.isfinite(cost_delta) or cost_delta < 0):
                 return False, "Reservation accounting corrupt", None
             script = """
             local raw = redis.call('GET', KEYS[3])
@@ -498,8 +528,8 @@ class Database:
             local decoded, acct = pcall(cjson.decode, raw)
             if not decoded or type(acct) ~= 'table' then return 3 end
             if acct['reconciled'] == true then return 2 end
-            if redis.call('GET', KEYS[1]) == ARGV[1] then redis.call('DEL', KEYS[1]) end
             redis.call('INCRBYFLOAT', KEYS[2], ARGV[2])
+            if redis.call('GET', KEYS[1]) == ARGV[1] then redis.call('DEL', KEYS[1]) end
             acct['reconciled'] = true
             acct['reconciled_at'] = ARGV[3]
             redis.call('SET', KEYS[3], cjson.encode(acct), 'EX', tonumber(ARGV[4]))
@@ -548,13 +578,17 @@ class Database:
                 }
             ])
 
-    def _atomic_update_state(self, call_id: str, updates=None, transcript=None):
+    def mark_call_ending(self, call_id: str) -> None:
+        self._atomic_update_state(call_id, updates={"status": "ending"}, only_if_active=True)
+
+    def _atomic_update_state(self, call_id: str, updates=None, transcript=None, only_if_active=False):
         if not (settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN):
             raise RuntimeError("Shared Redis is required for production call state")
         script = """
         local raw = redis.call('GET', KEYS[1])
         if not raw then return 0 end
         local state = cjson.decode(raw)
+        if ARGV[3] == 'active' and state.call.status ~= 'in-progress' then return 2 end
         local updates = cjson.decode(ARGV[1])
         for k,v in pairs(updates) do state.call[k] = v end
         if ARGV[2] ~= '' then
@@ -564,9 +598,12 @@ class Database:
         redis.call('SET', KEYS[1], cjson.encode(state), 'EX', 86400)
         return 1
         """
-        result = self._upstash_cmd(["EVAL", script, "1", f"apex:call:{call_id}",
-                                   json.dumps(updates or {}), json.dumps(transcript) if transcript else ""])
-        if result != 1:
+        command = ["EVAL", script, "1", f"apex:call:{call_id}",
+                   json.dumps(updates or {}), json.dumps(transcript) if transcript else ""]
+        if only_if_active:
+            command.append("active")
+        result = self._upstash_cmd(command)
+        if result != 1 and not (only_if_active and result == 2):
             raise RuntimeError("Call state missing; refusing unsafe local fallback")
 
     def ensure_durable_call_state(self, call_id: str, state_payload: Dict[str, Any]) -> str:

@@ -23,9 +23,9 @@ def redis(command):
     if op == "EVAL" and command[2] == "2":
         state[command[3]] = "1"
         return state.get(command[4])
-    if op == "EVAL" and command[2] == "6":
+    if op == "EVAL" and command[2] == "7":
         assert command[8] == db.CALL_PAUSE_KEY
-        assert "KEYS[6]" in command[1] and command[8] in state
+        assert "KEYS[6]" in command[1] and "KEYS[7]" in command[1] and command[8] in state
         return 6
     raise AssertionError(op)
 
