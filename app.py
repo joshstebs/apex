@@ -9,6 +9,7 @@ ApexVoice AI: Vercel-Ready Autonomous Telephony Platform
 - Secret-safe /api/health and /api/settings endpoints
 """
 import os
+import sqlite3
 import glob
 import json
 import uuid
@@ -77,6 +78,18 @@ def build_conversation_history(transcripts: List[Dict[str, Any]]) -> List[Dict[s
         for entry in transcripts
         if entry["speaker"] in roles
     ]
+
+
+def create_voice_clip(spoken_text: str, voice_id: Optional[str]) -> Optional[str]:
+    if not (voice_engine.elevenlabs_key or "").strip():
+        return None
+    try:
+        return db.create_tts_clip(
+            spoken_text, voice_id=voice_id or settings.ELEVENLABS_DEFAULT_VOICE_ID
+        )
+    except (RuntimeError, sqlite3.Error):
+        print("[Apex] TTS clip storage unavailable; falling back to carrier speech")
+        return None
 
 
 def handle_signalwire_inbound_or_connect(
@@ -160,10 +173,7 @@ def handle_signalwire_inbound_or_connect(
     replay = outcome == "replay"
     if not replay:
         db.add_transcript_message(call_id, "assistant", greeting, latency_ms=95)
-    # Create short-lived opaque TTS clip ID (zero conversation text in URL)
-    clip_id = None
-    if voice_engine.elevenlabs_key and voice_engine.elevenlabs_key.strip():
-        clip_id = db.create_tts_clip(greeting, voice_id=ast.get("voice_id") or settings.ELEVENLABS_DEFAULT_VOICE_ID)
+    clip_id = create_voice_clip(greeting, ast.get("voice_id"))
 
     return telephony.build_signalwire_cxml_gather(
         call_id=call_id,
@@ -263,10 +273,7 @@ def handle_signalwire_gather_turn(
         "cost_total": cost_info["cost_total"]
     })
 
-    # Create short-lived opaque TTS clip ID (zero conversation text in URL)
-    clip_id = None
-    if voice_engine.elevenlabs_key and voice_engine.elevenlabs_key.strip():
-        clip_id = db.create_tts_clip(reply_text, voice_id=ast.get("voice_id") or settings.ELEVENLABS_DEFAULT_VOICE_ID)
+    clip_id = create_voice_clip(reply_text, ast.get("voice_id"))
 
     if any(p in user_input.lower() for p in ["goodbye", "bye", "that's all", "hang up"]):
         db.update_call(call_id, {"status": "completed", "ended_at": datetime.utcnow().isoformat()})
