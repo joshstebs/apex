@@ -70,6 +70,15 @@ def reconstruct_public_webhook_url(request_url_str: str, headers: Dict[str, str]
         return urllib.parse.urlunsplit((proto.split(",")[0].strip(), host.split(",")[0].strip(), parsed.path, parsed.query, ""))
     return request_url_str
 
+def build_conversation_history(transcripts: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    roles = {"assistant": "assistant", "human": "user", "user": "user"}
+    return [
+        {"role": roles[entry["speaker"]], "content": entry["message"]}
+        for entry in transcripts
+        if entry["speaker"] in roles
+    ]
+
+
 def handle_signalwire_inbound_or_connect(
     params: Dict[str, str],
     query_params: Dict[str, str]
@@ -219,16 +228,11 @@ def handle_signalwire_gather_turn(
         ast = db.list_assistants()[0]
 
     # Redis state is authoritative across Vercel instances.
+    conv_history = build_conversation_history(db.get_call_transcripts(call_id))
     db.add_transcript_message(call_id, "human", user_input)
 
-    dynamic_vars = call.get("dynamic_vars_applied", {"user_name": "Josh Stebs"})
+    dynamic_vars = {"business_name": settings.RECEPTIONIST_BUSINESS_NAME, **(call.get("dynamic_vars_applied") or {})}
     rendered_prompt = VoiceEngine.render_prompt(ast["system_prompt"], dynamic_vars)
-
-    all_transcripts = db.get_call_transcripts(call_id)
-    conv_history = [
-        {"role": "assistant" if t["speaker"] == "assistant" else "user", "content": t["message"]}
-        for t in all_transcripts[:-1]
-    ]
 
     ai_result = voice_engine.generate_chat_response(
         system_prompt=rendered_prompt,
@@ -245,9 +249,9 @@ def handle_signalwire_gather_turn(
     extracted = call.get("extracted_data", {})
     if detected_tool:
         extracted[detected_tool.get("tool", "unnamed_tool")] = detected_tool.get("parameters", {})
-        db.update_call(call_id, {"extracted_data": extracted, "outcome_status": "success"})
+        db.update_call(call_id, {"extracted_data": extracted, "outcome_status": "recorded_for_followup"})
         db.add_transcript_message(
-            call_id, "tool", f"Action Triggered: {detected_tool.get('tool')} {json.dumps(detected_tool.get('parameters', {}))}"
+            call_id, "tool", f"Details captured: {detected_tool.get('tool')} {json.dumps(detected_tool.get('parameters', {}))}"
         )
 
     cost_info = VoiceEngine.calculate_call_cost(new_duration, provider="signalwire")
@@ -523,15 +527,10 @@ try:
         if not ast:
             raise HTTPException(status_code=404, detail="Assistant not found")
 
+        conv_history = build_conversation_history(db.get_call_transcripts(payload.call_id))
         db.add_transcript_message(payload.call_id, "human", payload.user_message)
-        dynamic_vars = call.get("dynamic_vars_applied", {})
+        dynamic_vars = {"business_name": settings.RECEPTIONIST_BUSINESS_NAME, **(call.get("dynamic_vars_applied") or {})}
         rendered_system_prompt = VoiceEngine.render_prompt(ast["system_prompt"], dynamic_vars)
-
-        all_transcripts = db.get_call_transcripts(payload.call_id)
-        conv_history = [
-            {"role": "assistant" if t["speaker"] == "assistant" else "user", "content": t["message"]}
-            for t in all_transcripts[:-1]
-        ]
 
         ai_result = voice_engine.generate_chat_response(
             system_prompt=rendered_system_prompt,
@@ -550,11 +549,11 @@ try:
         if detected_tool:
             extracted = call.get("extracted_data", {})
             extracted[detected_tool.get("tool", "unnamed_tool")] = detected_tool.get("parameters", {})
-            db.update_call(payload.call_id, {"extracted_data": extracted, "outcome_status": "success"})
+            db.update_call(payload.call_id, {"extracted_data": extracted, "outcome_status": "recorded_for_followup"})
             db.add_transcript_message(
                 payload.call_id,
                 "tool",
-                f"Action Triggered: {detected_tool.get('tool')} with {json.dumps(detected_tool.get('parameters', {}))}"
+                f"Details captured: {detected_tool.get('tool')} with {json.dumps(detected_tool.get('parameters', {}))}"
             )
 
         new_duration = min(call.get("duration_seconds", 0) + 15, settings.MAX_CALL_DURATION_SECONDS)
