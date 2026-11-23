@@ -14,7 +14,7 @@ import urllib.request
 import urllib.parse
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
-from config import settings
+from config import settings, is_production_runtime
 
 class Database:
     # Durable accounting outlives the short marker and 24h call-state TTL.
@@ -22,7 +22,7 @@ class Database:
 
     def __init__(self, db_path: str = None):
         self.db_path = db_path or settings.DB_PATH
-        if not os.getenv("VERCEL"):
+        if not is_production_runtime():
             self._init_db()
 
     def get_connection(self):
@@ -186,7 +186,7 @@ class Database:
             ])
 
         # A production clip must be accessible to another invocation.
-        if os.getenv("VERCEL"):
+        if is_production_runtime():
             if not (settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN):
                 raise RuntimeError("Shared Redis clip storage is required")
             return clip_id
@@ -240,7 +240,7 @@ class Database:
                         pass
 
         # Never serve instance-local clips in a serverless deployment.
-        if os.getenv("VERCEL"):
+        if is_production_runtime():
             return None
         # 3. Check Local SQLite
         with self.get_connection() as conn:
@@ -278,8 +278,8 @@ class Database:
         state_payload = {"call": call_record, "transcripts": []}
         # A single Redis Lua operation checks budget and acquires the slot atomically.
         # Reserve a conservative full-call allowance before allowing another call.
-        if os.getenv("VERCEL") and settings.durable_storage_backend() != "upstash_redis":
-            return False, "Upstash Redis is required for live Vercel calls", None
+        if is_production_runtime() and settings.durable_storage_backend() != "upstash_redis":
+            return False, "Upstash Redis is required for live production calls", None
         if settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN:
             reserve, reserve_err = self._call_reserve_usd()
             if reserve_err:
@@ -357,7 +357,7 @@ class Database:
                 return False, "Call already completed; duplicate admission refused", "duplicate"
             if ok == 2:
                 # Same call, already reserved: retry must not reserve twice.
-                if os.getenv("VERCEL"):
+                if is_production_runtime():
                     try:
                         self.ensure_durable_call_state(call_id, state_payload)
                     except Exception:
@@ -366,7 +366,7 @@ class Database:
             if ok == 3:
                 # Lock is ours but reservation accounting is missing. Recover only from
                 # durable state; never assume a month or amount.
-                if os.getenv("VERCEL"):
+                if is_production_runtime():
                     try:
                         state = self.load_durable_call_state(call_id) or {}
                         recovered = state.get("accounting") if isinstance(state, dict) else None
@@ -384,7 +384,7 @@ class Database:
                 return True, None, "replay"
             # ok == 1: fresh reservation.
 
-        if os.getenv("VERCEL"):
+        if is_production_runtime():
             try:
                 self.ensure_durable_call_state(call_id, state_payload)
             except Exception:
@@ -624,7 +624,7 @@ class Database:
     # STANDARD CRUD OPERATIONS
     # -------------------------------------------------------------------------
     def create_or_update_assistant(self, assistant_data: Dict[str, Any]) -> str:
-        if os.getenv("VERCEL"):
+        if is_production_runtime():
             raise RuntimeError("Assistant editing disabled in serverless mode; edit version-controlled prompt templates")
         with self.get_connection() as conn:
             cursor = conn.cursor()
@@ -669,7 +669,7 @@ class Database:
             return assistant_data["id"]
 
     def get_assistant(self, assistant_id: str) -> Optional[Dict[str, Any]]:
-        if os.getenv("VERCEL"):
+        if is_production_runtime():
             return next((a for a in self.list_assistants() if a.get("id") == assistant_id), None)
         with self.get_connection() as conn:
             cursor = conn.cursor()
@@ -684,7 +684,7 @@ class Database:
             return None
 
     def list_assistants(self) -> List[Dict[str, Any]]:
-        if os.getenv("VERCEL"):
+        if is_production_runtime():
             from pathlib import Path
             return [json.loads(f.read_text()) for f in sorted((Path(__file__).parent / "prompts").glob("*.json"))]
         with self.get_connection() as conn:
@@ -722,7 +722,7 @@ class Database:
             return call_data["id"]
 
     def update_call(self, call_id: str, updates: Dict[str, Any]):
-        if os.getenv("VERCEL"):
+        if is_production_runtime():
             allowed = {"status", "ended_at", "duration_seconds", "cost_telephony", "cost_llm", "cost_tts", "cost_total", "extracted_data", "outcome_status"}
             if set(updates) - allowed:
                 raise ValueError("Invalid call update field")
@@ -742,7 +742,7 @@ class Database:
             conn.commit()
 
     def get_call(self, call_id: str) -> Optional[Dict[str, Any]]:
-        if os.getenv("VERCEL"):
+        if is_production_runtime():
             state = self.load_durable_call_state(call_id)
             return state.get("call") if state else None
         with self.get_connection() as conn:
@@ -755,7 +755,7 @@ class Database:
             return data
 
     def list_calls(self, limit: int = 50) -> List[Dict[str, Any]]:
-        if os.getenv("VERCEL"):
+        if is_production_runtime():
             raise RuntimeError("Call listing requires a durable indexed store; not implemented")
         with self.get_connection() as conn:
             cursor = conn.cursor()
@@ -774,7 +774,7 @@ class Database:
             return results
 
     def add_transcript_message(self, call_id: str, speaker: str, message: str, latency_ms: int = 0):
-        if os.getenv("VERCEL"):
+        if is_production_runtime():
             self._atomic_update_state(call_id, transcript={"speaker": speaker, "message": message, "latency_ms": latency_ms, "timestamp": datetime.utcnow().isoformat()})
             return
         with self.get_connection() as conn:
@@ -786,7 +786,7 @@ class Database:
             conn.commit()
 
     def get_call_transcripts(self, call_id: str) -> List[Dict[str, Any]]:
-        if os.getenv("VERCEL"):
+        if is_production_runtime():
             state = self.load_durable_call_state(call_id)
             return state.get("transcripts", []) if state else []
         with self.get_connection() as conn:
