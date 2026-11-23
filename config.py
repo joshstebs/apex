@@ -4,6 +4,10 @@ All secrets are read strictly from environment variables and never exposed via A
 """
 import os
 
+def is_production_runtime() -> bool:
+    """Return whether this process runs in a serverless production environment."""
+    return bool(os.getenv("VERCEL") or os.getenv("CLOUDFLARE_WORKERS"))
+
 class AppSettings:
     def __init__(self):
         self.HOST: str = os.getenv("HOST", "0.0.0.0")
@@ -34,7 +38,7 @@ class AppSettings:
         self.RECEPTIONIST_ENABLED: bool = os.getenv("RECEPTIONIST_ENABLED", "false").lower() == "true"
         # Enforce webhook signature verification (enabled by default in production)
         # Production cannot disable provider-authenticated webhooks by mistake.
-        self.ENFORCE_WEBHOOK_SIGNATURE: bool = bool(os.getenv("VERCEL")) or os.getenv("ENFORCE_WEBHOOK_SIGNATURE", "true").lower() == "true"
+        self.ENFORCE_WEBHOOK_SIGNATURE: bool = is_production_runtime() or os.getenv("ENFORCE_WEBHOOK_SIGNATURE", "true").lower() == "true"
         
         # ElevenLabs Configuration
         self.ELEVENLABS_API_KEY: str = os.getenv("ELEVENLABS_API_KEY", "")
@@ -68,7 +72,7 @@ class AppSettings:
         # Outbound calling is completely disabled
         self.OUTBOUND_CALLING_ENABLED: bool = False
         
-        default_db = "/tmp/voice_agents.db" if os.getenv("VERCEL") else "voice_agents.db"
+        default_db = "/tmp/voice_agents.db" if is_production_runtime() else "voice_agents.db"
         self.DB_PATH: str = os.getenv("DB_PATH", default_db)
 
     def get_webhook_signing_key(self) -> str:
