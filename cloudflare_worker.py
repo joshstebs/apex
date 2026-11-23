@@ -4,7 +4,7 @@ import os
 from workers import asgi, env
 
 # FastAPI and the existing modules read settings from process environment at import.
-# Copy only the known runtime settings from Cloudflare's encrypted bindings.
+# Copy values from Cloudflare bindings before importing the application.
 _RUNTIME_SETTINGS = (
     "PUBLIC_URL",
     "SIGNALWIRE_SPACE_URL", "SIGNALWIRE_PROJECT_ID", "SIGNALWIRE_API_TOKEN",
@@ -28,10 +28,5 @@ for _key in _RUNTIME_SETTINGS:
 os.environ["CLOUDFLARE_WORKERS"] = "1"
 
 from app import app  # noqa: E402
-from workers import WorkerEntrypoint  # noqa: E402
 
-_asgi = asgi.entrypoint(app)
-
-class Default(WorkerEntrypoint):
-    async def fetch(self, request):
-        return await _asgi.fetch(request, self.env)
+Default = asgi.entrypoint(app)
