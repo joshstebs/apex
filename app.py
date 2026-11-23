@@ -19,7 +19,7 @@ import time
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 
-from config import settings
+from config import settings, is_production_runtime
 from database import Database
 from voice_engine import VoiceEngine
 from telephony import TelephonyGateway
@@ -81,7 +81,7 @@ def handle_signalwire_inbound_or_connect(
     """
     call_id = (params.get("CallSid") or "").strip()
     if not call_id:
-        if os.getenv("VERCEL"):
+        if is_production_runtime():
             return telephony.build_signalwire_cxml_hangup("Invalid call identifier. Goodbye.")
         call_id = f"call_{uuid.uuid4().hex[:12]}"
     from_number = params.get("From", "Unknown")
@@ -97,7 +97,7 @@ def handle_signalwire_inbound_or_connect(
             "The automated receptionist is not yet available. Please contact the business directly."
         )
     # Production calls must never proceed in an unconfigured text-only/silent demo.
-    if os.getenv("VERCEL") and not (
+    if is_production_runtime() and not (
         settings.get_webhook_signing_key()
         and settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN
         and settings.ELEVENLABS_API_KEY and settings.HUGGINGFACE_API_KEY
@@ -181,7 +181,7 @@ def handle_signalwire_gather_turn(
     call = db.get_call(call_id) if call_id else None
     if not call:
         return telephony.build_signalwire_cxml_hangup("Thank you for calling. Goodbye!")
-    if os.getenv("VERCEL"):
+    if is_production_runtime():
         holder = db._upstash_cmd(["GET", "apex:active_call_lock"])
         if holder != call_id or call.get("status") != "in-progress":
             return telephony.build_signalwire_cxml_hangup("This call session has ended. Goodbye.")
@@ -302,7 +302,7 @@ def get_sanitized_health_and_settings() -> Dict[str, Any]:
         "huggingface_llm_model": settings.HUGGINGFACE_LLM_MODEL,
         "durable_storage_backend": settings.durable_storage_backend(),
         "durable_storage_configured": (
-            settings.durable_storage_backend() == "upstash_redis" if os.getenv("VERCEL")
+            settings.durable_storage_backend() == "upstash_redis" if is_production_runtime()
             else settings.durable_storage_backend() in ("upstash_redis", "turso_libsql")
         ),
         "max_concurrent_calls": settings.MAX_CONCURRENT_CALLS,
@@ -399,7 +399,7 @@ try:
 
     @app.post("/api/assistants")
     def save_assistant(payload: AssistantPayload, admin=Depends(require_admin)):
-        if os.getenv("VERCEL"):
+        if is_production_runtime():
             raise HTTPException(status_code=503, detail="This feature is disabled until durable support is implemented")
         data = payload.model_dump()
         if not data.get("id"):
@@ -428,7 +428,7 @@ try:
                 detail="Outbound calling is completely disabled. Only inbound SignalWire calls and browser simulations are permitted."
             )
 
-        if os.getenv("VERCEL"):
+        if is_production_runtime():
             raise HTTPException(status_code=503, detail="This feature is disabled until durable support is implemented")
         ast = db.get_assistant(payload.assistant_id)
         if not ast:
@@ -464,7 +464,7 @@ try:
 
     @app.get("/api/calls")
     def list_calls(admin=Depends(require_admin)):
-        if os.getenv("VERCEL"):
+        if is_production_runtime():
             raise HTTPException(status_code=503, detail="Durable call listing is not implemented")
         return {"calls": db.list_calls()}
 
@@ -478,7 +478,7 @@ try:
 
     @app.post("/api/calls/{call_id}/terminate")
     def terminate_call(call_id: str, admin=Depends(require_admin)):
-        if os.getenv("VERCEL"):
+        if is_production_runtime():
             c = db.get_call(call_id)
             if not c:
                 raise HTTPException(status_code=404, detail="Call not found")
@@ -514,7 +514,7 @@ try:
 
     @app.post("/api/simulate/turn")
     def simulate_conversation_turn(payload: SimulationTurnPayload, admin=Depends(require_admin)):
-        if os.getenv("VERCEL"):
+        if is_production_runtime():
             raise HTTPException(status_code=503, detail="This feature is disabled until durable support is implemented")
         call = db.get_call(payload.call_id)
         if not call:
@@ -588,7 +588,7 @@ try:
         cache_key = f"apex:tts_audio:{clip_id}"
         lock_key = f"apex:tts_generating:{clip_id}"
         audio_bytes = None
-        if os.getenv("VERCEL"):
+        if is_production_runtime():
             encoded = db._upstash_cmd(["GET", cache_key])
             if encoded:
                 audio_bytes = base64.b64decode(encoded)
@@ -601,11 +601,11 @@ try:
                 audio_bytes = voice_engine.synthesize_speech_elevenlabs(clip["text"], voice_id=clip["voice_id"])
                 if not audio_bytes:
                     raise HTTPException(status_code=503, detail="ElevenLabs synthesis unavailable")
-                if os.getenv("VERCEL"):
+                if is_production_runtime():
                     # Redis string limits and storage quota apply. 120 seconds is intentional.
                     db._upstash_cmd(["SET", cache_key, base64.b64encode(audio_bytes).decode("ascii"), "EX", "120"])
             finally:
-                if os.getenv("VERCEL"):
+                if is_production_runtime():
                     db._upstash_cmd(["DEL", lock_key])
         return Response(
             content=audio_bytes,
@@ -681,7 +681,7 @@ try:
         authorization = request.headers.get("authorization", "")
         if not secret or not hmac.compare_digest(authorization, f"Bearer {secret}"):
             raise HTTPException(status_code=401, detail="Unauthorized")
-        if not os.getenv("VERCEL") or settings.durable_storage_backend() != "upstash_redis":
+        if not is_production_runtime() or settings.durable_storage_backend() != "upstash_redis":
             raise HTTPException(status_code=503, detail="Durable carrier enforcement unavailable")
         try:
             call_id = db._upstash_cmd(["GET", "apex:active_call_lock"])
@@ -732,6 +732,9 @@ try:
 
     @app.get("/", response_class=HTMLResponse)
     def serve_index():
+        if os.getenv("CLOUDFLARE_WORKERS"):
+            from cloudflare_static import DASHBOARD_HTML
+            return DASHBOARD_HTML
         index_path = os.path.join(os.path.dirname(__file__), "static", "index.html")
         if os.path.exists(index_path):
             with open(index_path, "r", encoding="utf-8") as f:
