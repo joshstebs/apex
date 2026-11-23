@@ -24,6 +24,6 @@
     "MAX_CALL_DURATION_SECONDS": "1200",
     "MONTHLY_BUDGET_LIMIT_USD": "5.00",
     "TTS_CLIP_TTL_SECONDS": "120",
-    "PUBLIC_URL": "https://apexvoice-cloudflare.workers.dev"
+    "PUBLIC_URL": "https://apexvoice-cloudflare.josh-stebs.workers.dev"
   }
 }
