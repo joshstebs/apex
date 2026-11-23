@@ -1,0 +1,16 @@
+[project]
+name = "apexvoice-cloudflare"
+version = "0.1.0"
+description = "ApexVoice FastAPI application running on Cloudflare Python Workers"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "pydantic>=2.0",
+    "python-multipart>=0.0.6",
+]
+
+[dependency-groups]
+dev = [
+    "workers-py>=1.72.0",
+    "workers-runtime-sdk",
+]
