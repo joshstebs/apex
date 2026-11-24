@@ -34,6 +34,11 @@ class TelephonyGateway:
         """Ask SignalWire to complete an active call. A successful HTTP response
         means a request was accepted, not that billing has been reconciled.
         """
+        if settings.STAGING or settings.TELEPHONY_PROVIDER == "mock":
+            if not re.fullmatch(r"[a-zA-Z0-9-]{10,80}", call_sid or ""):
+                raise ValueError("Invalid call SID")
+            # Mock carrier: validate the identifier and do not open a network connection.
+            return False
         if not (self.signalwire_project_id and self.signalwire_token and self.signalwire_space):
             raise RuntimeError("SignalWire credentials are not configured")
         if not re.fullmatch(r"[a-zA-Z0-9-]{10,80}", call_sid or ""):

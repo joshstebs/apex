@@ -9,6 +9,7 @@ settings.UPSTASH_REDIS_REST_TOKEN='test'
 store={}
 def redis(cmd):
     op=cmd[0]
+    if op=='EXISTS':return int(cmd[1] in store)
     if op=='GET':return store.get(cmd[1])
     if op=='SET':
         if 'NX' in cmd and cmd[1] in store:return None
