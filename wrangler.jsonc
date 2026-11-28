@@ -1,0 +1,29 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "apexvoice-cloudflare",
+  "main": "cloudflare_worker.py",
+  "compatibility_date": "2026-11-23",
+  "compatibility_flags": ["python_workers"],
+  "workers_dev": true,
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "vars": {
+    "CLOUDFLARE_WORKERS": "1",
+    "RECEPTIONIST_ENABLED": "false",
+    "REQUIRE_MATCHING_INBOUND_NUMBER": "true",
+    "ALLOW_INBOUND_ASSISTANT_OVERRIDE": "false",
+    "SIGNALWIRE_PHONE_NUMBER": "+12267732234",
+    "SIGNALWIRE_PHONE_NUMBER_ID": "8f935d8b-bd61-457b-b421-edddfef247ea",
+    "INBOUND_ASSISTANT_ID": "tpl_hm_receptionist",
+    "RECEPTIONIST_BUSINESS_NAME": "Harbour & Main",
+    "ELEVENLABS_DEFAULT_VOICE_ID": "21m00Tcm4TlvDq8ikWAM",
+    "ELEVENLABS_MODEL_ID": "eleven_turbo_v2_5",
+    "MAX_CONCURRENT_CALLS": "1",
+    "MAX_CALL_DURATION_SECONDS": "1200",
+    "MONTHLY_BUDGET_LIMIT_USD": "5.00",
+    "TTS_CLIP_TTL_SECONDS": "120",
+    "PUBLIC_URL": "https://apexvoice-cloudflare.josh-stebs.workers.dev"
+  }
+}
