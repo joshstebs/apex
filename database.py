@@ -10,6 +10,7 @@ import json
 import math
 import time
 import secrets
+import hashlib
 import os
 import re
 import base64
@@ -191,7 +192,9 @@ class Database:
         Conversation text never appears in any URL.
         """
         ttl = ttl_seconds or settings.TTS_CLIP_TTL_SECONDS
-        clip_id = f"clip_{secrets.token_urlsafe(18)}"
+        # Synthesis cost is proportional to the text, so the same words reuse the
+        # same clip. A retried webhook then hits the audio cache instead of paying again.
+        clip_id = "clip_" + hashlib.sha256(f"{voice_id}\n{text}".encode("utf-8")).hexdigest()[:32]
         now = time.time()
         expires_at = now + ttl
         payload = {"text": text, "voice_id": voice_id, "expires_at": expires_at}
@@ -363,6 +366,15 @@ class Database:
         except Exception:
             return False
         return result == "OK"
+
+    def note_paid_tts(self, clip_id: str, audio: bytes) -> None:
+        """Remember audio that was already paid for, even when the shared cache write fails.
+
+        This keeps a cache outage from charging the same clip twice on the next
+        carrier retry, without pretending the shared cache succeeded.
+        """
+        if clip_id and audio:
+            self._local_tts_audio[clip_id] = audio
 
     def read_cached_tts_audio(self, clip_id: str) -> Optional[bytes]:
         cached = self._local_tts_audio.get(clip_id)

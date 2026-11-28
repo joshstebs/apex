@@ -1247,7 +1247,8 @@ try:
                     db.note_ops_error("tts_playback_failed")
                     raise HTTPException(status_code=503, detail="ElevenLabs synthesis unavailable")
                 # A failed cache write must not hide the bytes already synthesized for this request.
-                db.cache_tts_audio(clip_id, audio_bytes)
+                if not db.cache_tts_audio(clip_id, audio_bytes):
+                    db.note_paid_tts(clip_id, audio_bytes)
             finally:
                 if db.uses_shared_state():
                     db._upstash_cmd(["DEL", lock_key])
