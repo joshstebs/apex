@@ -12,3 +12,6 @@ venv/
 *.db-*
 *.sqlite*
 .DS_Store
+
+# Local agent tooling, not part of the application
+.commandcode/
