@@ -11,7 +11,8 @@ from . import api_models, routing, usage
 from .auth import AuthService, hash_password, verify_password
 from .errors import (
     AuthenticationFailed, Conflict, NotFound, PermissionDenied,
-    PlanLimitReached, TenantNotActive, TenancyError, UnknownNumber,
+    ConfigNotStarted, PlanLimitReached, TenantNotActive, TenancyError,
+    UnknownNumber, VersionConflict,
     ValidationFailed,
 )
 from .ids import generate_prefixed_id, generate_tenant_id, is_valid_e164, normalize_phone
@@ -33,7 +34,8 @@ __all__ = [
     "api_models", "routing", "usage",
     "AuthService", "hash_password", "verify_password",
     "AuthenticationFailed", "Conflict", "NotFound", "PermissionDenied",
-    "PlanLimitReached", "TenantNotActive", "TenancyError", "UnknownNumber",
+    "ConfigNotStarted", "PlanLimitReached", "TenantNotActive", "TenancyError",
+    "UnknownNumber", "VersionConflict",
     "ValidationFailed",
     "generate_prefixed_id", "generate_tenant_id", "is_valid_e164", "normalize_phone",
     "HARBOUR_MAIN_TENANT_ID", "TenantLifecycle", "legacy_env_to_business_config",

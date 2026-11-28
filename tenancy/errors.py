@@ -53,3 +53,23 @@ class UnknownNumber(TenancyError):
 class TenantNotActive(TenancyError):
     code = "tenant_not_active"
     http_status = 403
+
+
+class VersionConflict(TenancyError):
+    """Optimistic concurrency failure on a versioned resource.
+
+    Carries the current version so the adapter can emit the contract
+    body {error: {code: version_conflict, currentVersion: n}}.
+    """
+    code = "version_conflict"
+    http_status = 409
+
+    def __init__(self, message, current_version=None):
+        super().__init__(message)
+        self.current_version = current_version
+
+
+class ConfigNotStarted(TenancyError):
+    """The tenant exists but has not started configuration yet."""
+    code = "config_not_started"
+    http_status = 404

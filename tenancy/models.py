@@ -338,6 +338,7 @@ class CallRecord(_Record):
     summary: object = None
     appointment_id: object = None
     message_id: object = None
+    ended_at: object = None
 
 
 @dataclass
@@ -349,6 +350,7 @@ class MessageRecord(_Record):
     preferred_time: str = ""
     urgent: bool = False
     handled: bool = False
+    delivery: object = None
 
 
 @dataclass
