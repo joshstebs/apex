@@ -19,8 +19,8 @@ headers = {"Authorization": "Bearer dashboard-admin-token"}
 
 
 def run():
-    database = tempfile.NamedTemporaryFile(suffix=".db")
-    db.db_path = database.name
+    database = tempfile.TemporaryDirectory()
+    db.db_path = os.path.join(database.name, "dashboard.db")
     db._init_db()
     seed_default_assistants()
     db.create_call({
@@ -71,7 +71,7 @@ def run():
     rendered = payload.text
     for secret in ("dashboard-admin-token", "must-not-leak", "SIGNALWIRE_API_TOKEN", "ELEVENLABS_API_KEY"):
         assert secret not in rendered
-    database.close()
+    database.cleanup()
     print("PASS: admin dashboard shows calls, messages, errors and budget without secrets")
 
 

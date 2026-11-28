@@ -16,6 +16,7 @@ import base64
 import urllib.request
 import urllib.parse
 from datetime import datetime
+from contextlib import contextmanager
 from typing import List, Dict, Any, Optional, Tuple
 from config import settings
 
@@ -34,12 +35,17 @@ class Database:
         if not os.getenv("VERCEL"):
             self._init_db()
 
+    @contextmanager
     def get_connection(self):
         conn = sqlite3.connect(self.db_path, timeout=10.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute("PRAGMA synchronous = NORMAL")
-        return conn
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA synchronous = NORMAL")
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _init_db(self):
         with self.get_connection() as conn:

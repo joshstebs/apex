@@ -63,8 +63,8 @@ def answer(system_prompt, conversation_history, new_human_input, temperature=0.4
 
 
 def run():
-    database = tempfile.NamedTemporaryFile(suffix=".db")
-    db.db_path = database.name
+    database = tempfile.TemporaryDirectory()
+    db.db_path = os.path.join(database.name, "call-flow.db")
     db._init_db()
     seed_default_assistants()
     sid = "CA-flow-000000000001"
@@ -139,7 +139,7 @@ def run():
         assert db.get_call(voicemail_sid)["duration_seconds"] == 45
         opened.assert_not_called()
 
-    database.close()
+    database.cleanup()
     print("PASS: mocked inbound call captured a message, voicemail, hangup and history")
 
 
