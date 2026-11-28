@@ -873,6 +873,58 @@ def run_staging_exercise() -> Dict[str, Any]:
 
 
 # =========================================================================
+# IN-PROCESS MAINTENANCE WATCHDOG
+# =========================================================================
+_watchdog_stop = None
+_watchdog_thread = None
+
+
+def _watchdog_loop(stop_event, cycle) -> None:
+    """Call the maintenance cycle until stopped. Errors never kill the thread."""
+    while not stop_event.wait(settings.MAINTENANCE_INTERVAL_SECONDS):
+        try:
+            cycle()
+        except Exception as exc:  # pragma: no cover - defensive, logged as a code
+            log_ops_failure("watchdog cycle", exc)
+            try:
+                db.note_ops_error("watchdog_cycle_failed")
+            except Exception:
+                pass
+
+
+def start_maintenance_watchdog(cycle=None) -> bool:
+    """Run duration enforcement inside a container so the cap needs no scheduler.
+
+    Without this, a live call on a container is only cut off when an external
+    scheduler calls the maintenance endpoint, and admission refuses new calls
+    when that heartbeat is stale. Serverless cannot host a thread, so it is off.
+    """
+    global _watchdog_stop, _watchdog_thread
+    if _watchdog_thread is not None and _watchdog_thread.is_alive():
+        return False
+    if not settings.AUTO_MAINTENANCE or settings.call_state_store() != "upstash_redis":
+        return False
+    import threading
+
+    _watchdog_stop = threading.Event()
+    target = cycle or run_maintenance_cycle
+    _watchdog_thread = threading.Thread(
+        target=_watchdog_loop, args=(_watchdog_stop, target),
+        name="apex-maintenance", daemon=True,
+    )
+    _watchdog_thread.start()
+    return True
+
+
+def stop_maintenance_watchdog() -> None:
+    global _watchdog_stop, _watchdog_thread
+    if _watchdog_stop is not None:
+        _watchdog_stop.set()
+    _watchdog_stop = None
+    _watchdog_thread = None
+
+
+# =========================================================================
 # FASTAPI APPLICATION (VERCEL ASGI RUNTIME)
 # =========================================================================
 try:
@@ -902,6 +954,11 @@ try:
     @app.on_event("startup")
     def startup_event():
         seed_default_assistants()
+        start_maintenance_watchdog()
+
+    @app.on_event("shutdown")
+    def shutdown_event():
+        stop_maintenance_watchdog()
 
     class AssistantPayload(BaseModel):
         id: Optional[str] = None
@@ -1337,6 +1394,50 @@ try:
             raise HTTPException(status_code=503, detail="Call settlement unavailable") from exc
         return {"status": "ok", "budget_reconciled": True, "settlement": outcome}
 
+    def run_maintenance_cycle() -> Dict[str, Any]:
+        """Enforce the duration cap and settle stale reservations once.
+
+        Shared by the scheduler endpoint and the in-process watchdog so both use
+        identical logic. Callers must have verified that shared state exists.
+        """
+        # Preserve any legacy leased slot before it expires while a call is active.
+        call_id, paused = db._upstash_cmd([
+            "EVAL",
+            "local id = redis.call('GET', KEYS[1]); if id then redis.call('PERSIST', KEYS[1]) end; "
+            "return {id or false, redis.call('EXISTS', KEYS[2])}",
+            "2", db.ACTIVE_CALL_KEY, db.CALL_PAUSE_KEY
+        ])
+        requested = False
+        if call_id:
+            call = db.get_call(call_id)
+            recoverable = ("in-progress", "ending", "stale_unsettled")
+            if not call or call.get("status") not in recoverable:
+                # A terminal callback can be between recording state and settling the slot.
+                if db._upstash_cmd(["GET", db.ACTIVE_CALL_KEY]) == call_id:
+                    raise RuntimeError("Active call settlement pending")
+            else:
+                started = datetime.fromisoformat(call["started_at"].replace("Z", "+00:00"))
+                if started.tzinfo is None:
+                    started = started.replace(tzinfo=timezone.utc)
+                seconds = max(0, (datetime.now(timezone.utc) - started).total_seconds())
+                past_grace = seconds >= settings.MAX_CALL_DURATION_SECONDS + settings.STALE_SETTLEMENT_GRACE_SECONDS
+                still_holding = db._upstash_cmd(["GET", db.ACTIVE_CALL_KEY]) == call_id
+                # Past the grace window, accounting recovery does not depend on the carrier.
+                if still_holding and not past_grace and (paused or seconds >= settings.MAX_CALL_DURATION_SECONDS):
+                    requested = telephony.terminate_signalwire_call(call_id)
+                    if not requested:
+                        raise RuntimeError("Carrier rejected termination")
+        stale = sweep_stale_reservations()
+        stale_settled = sum(1 for item in stale if item.get("outcome") == "released")
+        if db._upstash_cmd(["SET", db.SCHEDULER_KEY, "1", "EX", "180"]) != "OK":
+            raise RuntimeError("Could not verify scheduler heartbeat")
+        return {
+            "checked": True,
+            "active": bool(call_id),
+            "termination_requested": requested,
+            "stale_settled": stale_settled,
+        }
+
     @app.post("/api/maintenance/enforce-call-duration")
     def enforce_call_duration(request: Request):
         secret = settings.CRON_SECRET
@@ -1346,43 +1447,7 @@ try:
         if settings.call_state_store() != "upstash_redis":
             raise HTTPException(status_code=503, detail="Durable carrier enforcement unavailable")
         try:
-            # Preserve any legacy leased slot before it expires while a call is active.
-            call_id, paused = db._upstash_cmd([
-                "EVAL",
-                "local id = redis.call('GET', KEYS[1]); if id then redis.call('PERSIST', KEYS[1]) end; "
-                "return {id or false, redis.call('EXISTS', KEYS[2])}",
-                "2", db.ACTIVE_CALL_KEY, db.CALL_PAUSE_KEY
-            ])
-            requested = False
-            if call_id:
-                call = db.get_call(call_id)
-                recoverable = ("in-progress", "ending", "stale_unsettled")
-                if not call or call.get("status") not in recoverable:
-                    # A terminal callback can be between recording state and settling the slot.
-                    if db._upstash_cmd(["GET", db.ACTIVE_CALL_KEY]) == call_id:
-                        raise HTTPException(status_code=503, detail="Active call settlement pending")
-                else:
-                    started = datetime.fromisoformat(call["started_at"].replace("Z", "+00:00"))
-                    if started.tzinfo is None:
-                        started = started.replace(tzinfo=timezone.utc)
-                    seconds = max(0, (datetime.now(timezone.utc) - started).total_seconds())
-                    past_grace = seconds >= settings.MAX_CALL_DURATION_SECONDS + settings.STALE_SETTLEMENT_GRACE_SECONDS
-                    still_holding = db._upstash_cmd(["GET", db.ACTIVE_CALL_KEY]) == call_id
-                    # Past the grace window, accounting recovery does not depend on the carrier.
-                    if still_holding and not past_grace and (paused or seconds >= settings.MAX_CALL_DURATION_SECONDS):
-                        requested = telephony.terminate_signalwire_call(call_id)
-                        if not requested:
-                            raise HTTPException(status_code=502, detail="Carrier rejected termination")
-            stale = sweep_stale_reservations()
-            stale_settled = sum(1 for item in stale if item.get("outcome") == "released")
-            if db._upstash_cmd(["SET", db.SCHEDULER_KEY, "1", "EX", "180"]) != "OK":
-                raise RuntimeError("Could not verify scheduler heartbeat")
-            return {
-                "checked": True,
-                "active": bool(call_id),
-                "termination_requested": requested,
-                "stale_settled": stale_settled,
-            }
+            return run_maintenance_cycle()
         except HTTPException:
             raise
         except (RuntimeError, ValueError, TypeError, KeyError) as exc:

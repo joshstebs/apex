@@ -99,6 +99,18 @@ class AppSettings:
         except (TypeError, ValueError):
             staging_rate = 10
         self.STAGING_WEBHOOK_RATE_LIMIT_PER_MINUTE: int = max(1, min(staging_rate, 60))
+        # A container can run its own watchdog, so the 20-minute cap does not depend
+        # on an external scheduler. Serverless has no long-lived process, so it must
+        # keep using the external scheduler endpoint.
+        try:
+            interval = int(os.getenv("MAINTENANCE_INTERVAL_SECONDS", "60"))
+        except (TypeError, ValueError):
+            interval = 60
+        self.MAINTENANCE_INTERVAL_SECONDS: int = max(15, min(interval, 300))
+        self.AUTO_MAINTENANCE: bool = (
+            os.getenv("AUTO_MAINTENANCE", "true" if is_hosted_runtime() and not is_serverless_runtime() else "false")
+            .strip().lower() in ("1", "true", "yes")
+        )
         self.OUTBOUND_NUMBER_ALLOWLIST: tuple = tuple(
             item.strip() for item in os.getenv("OUTBOUND_NUMBER_ALLOWLIST", "").split(",") if item.strip()
         )
