@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en-CA">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ApexVoice Dashboard - Harbour and Main</title>
+<style>
+:root{--bg:#0b1423;--panel:#162238;--panel2:#1c2c47;--text:#eef4f3;--muted:#a9bcc5;--accent:#75d9c5;--border:#2b3f5c;--focus:#ffd166;--danger:#ffb4a2}
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:var(--bg);color:var(--text);line-height:1.5}
+a{color:var(--accent)}:focus-visible{outline:3px solid var(--focus);outline-offset:2px}
+header,main,footer{max-width:1080px;margin:0 auto;padding:16px}header{border-bottom:1px solid var(--border)}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:16px;margin:14px 0}.sub{color:var(--muted)}
+input{width:100%;padding:11px;border-radius:9px;border:1px solid var(--border);background:#0f1c30;color:var(--text);font:inherit}
+.btn{background:var(--accent);color:#0b1423;border:0;border-radius:10px;padding:11px 16px;font-weight:700;cursor:pointer}.btn.secondary{background:transparent;color:var(--text);border:1px solid var(--border)}.btn.small{padding:7px 10px}
+.grid{display:grid;gap:14px}@media(min-width:760px){.grid{grid-template-columns:1fr 1fr}}
+nav.top{display:flex;gap:14px;flex-wrap:wrap}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:8px;border-bottom:1px solid var(--border);vertical-align:top}
+details{border:1px solid var(--border);border-radius:10px;padding:10px;margin:8px 0}pre{white-space:pre-wrap;word-break:break-word}
+.pill{display:inline-block;border:1px solid var(--border);border-radius:999px;padding:3px 9px;font-size:.85rem;color:var(--muted)}
+</style></head>
+<body>
+<header>
+<nav class="top" aria-label="Main"><a href="onboarding.html">Onboarding</a><a href="demo.html">Interactive demo</a><span class="pill">Customer dashboard</span></nav>
+<h1>ApexVoice dashboard</h1>
+<p class="sub">Real data from your ApexVoice service when connected. If a section has no data, it says so. Nothing here is simulated.</p>
+</header>
+<main>
+<section class="card" aria-labelledby="statusH"><h2 id="statusH">Service status</h2><p id="healthStatus">Checking public health endpoint...</p><div id="healthDetail"></div><button type="button" class="btn secondary small" id="refreshHealth">Refresh status</button></section>
+
+<section class="card" aria-labelledby="connectH"><h2 id="connectH">Connect to your service</h2>
+<p class="sub">Your admin token is kept in this tab memory only. It is never saved to local storage and never put in the address bar. Closing or refreshing this tab clears it.</p>
+<label for="token">Admin token</label><input id="token" type="password" autocomplete="off" placeholder="Paste APEX_ADMIN_TOKEN">
+<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px"><button type="button" class="btn" id="connectBtn">Connect</button><button type="button" class="btn secondary" id="refreshBtn">Refresh data</button><button type="button" class="btn secondary" id="disconnectBtn">Disconnect and clear token</button></div>
+<p id="connectStatus" aria-live="polite"></p></section>
+
+<div class="grid">
+<section class="card"><h2>Recent calls</h2><div id="calls"><p class="sub">Connect to load recent calls.</p></div></section>
+<section class="card"><h2>Missed calls</h2><div id="missed"><p class="sub">Missed call tracking appears here once calls are recorded.</p></div></section>
+<section class="card"><h2>Messages and inquiries</h2><div id="messages"><p class="sub">Connect to load messages.</p></div></section>
+<section class="card"><h2>Appointments</h2><div id="appointments"><p class="sub">No appointments endpoint exists yet. Appointment requests will appear here once the backend endpoint (GET /api/appointments) is live. If your configuration enables booking requests, callers can request times and the business confirms them.</p></div></section>
+<section class="card"><h2>Customers</h2><div id="customers"><p class="sub">Customer contacts are derived only from real messages you have received. Connect to load them.</p></div></section>
+<section class="card"><h2>Usage and estimated cost</h2><div id="usage"><p class="sub">Connect to load usage. Figures from the API are labelled as estimated application spend, not a carrier invoice.</p></div></section>
+<section class="card"><h2>Receptionist configuration</h2><div id="configSummary"></div><p><a href="onboarding.html">Edit configuration in onboarding</a></p></section>
+<section class="card"><h2>Business knowledge</h2><div id="knowledge"></div><p><a href="onboarding.html">Edit services and FAQs in onboarding</a></p></section>
+<section class="card"><h2>Connection status</h2><div id="connDetail"><p class="sub">Not connected yet.</p></div></section>
+</div>
+</main>
+<footer><p class="sub">ApexVoice by Harbour and Main. This dashboard reads the live API on this origin. It does not create data.</p></footer>
+<script>
+let token='';let lastDashboard=null;
+const el=id=>document.getElementById(id);
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+async function health(){el('healthStatus').textContent='Checking...';try{const r=await fetch('/api/health');if(!r.ok)throw new Error(r.status);const d=await r.json();el('healthStatus').innerHTML='<span class="pill">Health endpoint responded</span>';el('healthDetail').innerHTML=`<pre>${esc(JSON.stringify(d,null,2))}</pre>`}catch(e){el('healthStatus').textContent='Health endpoint could not be reached from this page. The service may be offline, or this page may be opened from a different origin.';el('healthDetail').innerHTML=''}}
+function headers(){return{Authorization:'Bearer '+token}}
+function renderConfig(){let c=null;try{c=JSON.parse(localStorage.getItem('apex_business_config')||'null')}catch(e){}
+if(!c){el('configSummary').innerHTML='<p class="sub">No local business configuration found in this browser yet.</p>';el('knowledge').innerHTML='<p class="sub">Add services and FAQs in onboarding and they will appear here.</p>';return}
+el('configSummary').innerHTML=`<p><strong>${esc(c.businessName||'Unnamed business')}</strong></p><p class="sub">Receptionist: ${esc(c.receptionistName||'Not set')}<br>Greeting: ${esc(c.greeting||'Not set')}<br>Industry: ${esc(c.industry||'Not set')}<br>Booking requests: ${c.bookingPrefs?.enabled?'Enabled':'Not enabled'}${c.bookingPrefs?.approvalRequired?', business confirmation required':''}</p>`;
+const svc=(c.services||[]).map(s=>`<li>${esc(s.name)}${s.price?' - '+esc(s.price):''}</li>`).join('');const faq=(c.faqs||[]).map(f=>`<li><strong>${esc(f.q)}</strong><br>${esc(f.a)}</li>`).join('');
+el('knowledge').innerHTML=(svc?`<h3>Services</h3><ul>${svc}</ul>`:'<p class="sub">No services saved yet.</p>')+(faq?`<h3>FAQs</h3><ul>${faq}</ul>`:'<p class="sub">No FAQs saved yet.</p>');
+let mins='';el('usage').dataset.configNote='';if(c.bookingPrefs)el('usage').dataset.configNote='Local configuration present. Included minutes and plan limits are confirmed at activation and are not assumed here.'}
+function callRow(c){const summary=c.summary||c.transcript||c.notes||'';const detail=(c.summary||c.transcript)?`<details><summary>Call detail</summary>${c.summary?`<p><strong>Summary:</strong> ${esc(c.summary)}</p>`:''}${c.transcript?`<p><strong>Transcript:</strong></p><pre>${esc(c.transcript)}</pre>`:''}</details>`:'';return`<div style="border-bottom:1px solid var(--border);padding:8px 0"><p><strong>${esc(c.caller_name||c.caller||c.from||c.phone||'Caller')}</strong> <span class="pill">${esc(c.status||c.outcome||'')}</span></p><p class="sub">${esc(c.created_at||c.started_at||c.time||'')} ${esc(c.duration_seconds?c.duration_seconds+' seconds':'')}</p>${detail}</div>`}
+async function load(){if(!token){el('connectStatus').textContent='Enter your admin token first.';return}
+el('connectStatus').textContent='Loading...';try{
+const [dr,mr]=await Promise.all([fetch('/api/dashboard',{headers:headers()}),fetch('/api/receptionist/messages',{headers:headers()})]);
+if(!dr.ok)throw new Error('Dashboard request failed: '+dr.status);const d=await dr.json();lastDashboard=d;
+let msgs=[];if(mr.ok){const md=await mr.json();msgs=Array.isArray(md)?md:(md.messages||[])}
+const calls=d.recent_calls||[];el('calls').innerHTML=calls.length?calls.map(callRow).join(''):'<p class="sub">No calls yet.</p>';
+const missed=calls.filter(c=>/miss|no.?answer|unanswered|failed/i.test(String(c.status||'')+' '+String(c.outcome||'')));
+el('missed').innerHTML=calls.length?(missed.length?missed.map(callRow).join(''):'<p class="sub">No missed or no-answer calls were found in the recent calls returned by the API.</p>'):'<p class="sub">Missed call tracking appears here once calls are recorded.</p>';
+const allMsgs=(d.messages&&d.messages.length?d.messages:msgs)||[];
+el('messages').innerHTML=allMsgs.length?allMsgs.map(m=>`<div style="border-bottom:1px solid var(--border);padding:8px 0"><p><strong>${esc(m.caller_name||'Caller')}</strong> - ${esc(m.callback_number||'')}</p><p>${esc(m.reason||'')}</p><p class="sub">Preferred contact: ${esc(m.preferred_contact_time||'Not stated')}</p></div>`).join(''):'<p class="sub">No messages yet.</p>';
+const uniq={};allMsgs.forEach(m=>{if(m.callback_number)uniq[m.callback_number]=m.caller_name||uniq[m.callback_number]||''});
+el('customers').innerHTML=Object.keys(uniq).length?`<ul>${Object.entries(uniq).map(([n,name])=>`<li>${esc(name)} - ${esc(n)}</li>`).join('')}</ul>`:'<p class="sub">No customer contacts derived from messages yet.</p>';
+const appts=d.appointments||d.bookings||[];if(appts.length){el('appointments').innerHTML=appts.map(a=>`<p>${esc(JSON.stringify(a))}</p>`).join('')}else{el('appointments').innerHTML='<p class="sub">No appointments endpoint exists yet. Appointment requests will appear here once the backend endpoint (GET /api/appointments) is live.</p>'}
+const b=d.budget||{};el('usage').innerHTML=`<p>Estimated application spend: <strong>${b.spend_usd!==undefined?'$'+esc(b.spend_usd)+' USD':'Not reported'}</strong></p><p class="sub">Budget cap: ${b.cap_usd!==undefined?'$'+esc(b.cap_usd)+' USD':'Not reported'}<br>Telephony provider: ${esc(d.telephony_provider||'Not reported')}<br>Environment: ${esc(d.environment||'Not reported')}<br>This is estimated application spend from the API, not a carrier invoice. Included minutes and plan limits are confirmed at activation.</p>${el('usage').dataset.configNote?`<p class="sub">${esc(el('usage').dataset.configNote)}</p>`:''}`;
+el('connDetail').innerHTML=`<p><span class="pill">Connected</span></p><p class="sub">Live call: ${d.live_call?esc(JSON.stringify(d.live_call)):'None reported'}<br>Notices: ${(d.notices||[]).length}<br>Errors: ${(d.errors||[]).length}</p>${(d.errors||[]).length?`<pre>${esc(JSON.stringify(d.errors,null,2))}</pre>`:''}${(d.notices||[]).length?`<pre>${esc(JSON.stringify(d.notices,null,2))}</pre>`:''}`;
+el('connectStatus').textContent='Connected. Data refreshed.'}catch(e){el('connectStatus').textContent='Could not load data: '+e.message+'. Check the token and that the service is running on this origin.';el('calls').innerHTML='<p class="sub">No data loaded. Connect with a valid token to see recent calls.</p>'}}
+el('connectBtn').addEventListener('click',()=>{token=el('token').value.trim();load()});
+el('refreshBtn').addEventListener('click',()=>{health();load()});
+el('disconnectBtn').addEventListener('click',()=>{token='';el('token').value='';lastDashboard=null;el('connectStatus').textContent='Disconnected. Token cleared from this tab.';el('connDetail').innerHTML='<p class="sub">Not connected.</p>'});
+el('refreshHealth').addEventListener('click',health);
+health();renderConfig();
+</script>
+</body></html>

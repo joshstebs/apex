@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en-CA">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ApexVoice Onboarding - Harbour and Main</title>
+<style>
+:root{--bg:#0b1423;--panel:#162238;--panel2:#1c2c47;--text:#eef4f3;--muted:#a9bcc5;--accent:#75d9c5;--accent2:#0b1423;--border:#2b3f5c;--danger:#ffb4a2;--focus:#ffd166}
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:var(--bg);color:var(--text);line-height:1.5}
+a{color:var(--accent)}:focus-visible{outline:3px solid var(--focus);outline-offset:2px}
+header,main,footer{max-width:980px;margin:0 auto;padding:16px}
+header{border-bottom:1px solid var(--border)}h1{font-size:1.7rem;margin:.3rem 0}h2{font-size:1.25rem}h3{font-size:1rem}
+.sub{color:var(--muted)}.card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:16px;margin:14px 0}
+label{display:block;font-weight:600;margin:12px 0 4px}input,select,textarea{width:100%;padding:11px;border-radius:9px;border:1px solid var(--border);background:#0f1c30;color:var(--text);font:inherit}
+textarea{min-height:84px}.row{display:grid;gap:12px}@media(min-width:700px){.row{grid-template-columns:1fr 1fr}.row3{grid-template-columns:1fr 1fr 1fr}}
+.btn{background:var(--accent);color:var(--accent2);border:0;border-radius:10px;padding:11px 16px;font-weight:700;cursor:pointer}.btn.secondary{background:transparent;color:var(--text);border:1px solid var(--border)}.btn.small{padding:7px 10px;font-size:.9rem}
+.progress{display:flex;gap:6px;flex-wrap:wrap;margin:14px 0}.step-pill{padding:6px 10px;border:1px solid var(--border);border-radius:999px;color:var(--muted);font-size:.85rem}.step-pill.active{border-color:var(--accent);color:var(--accent)}.step-pill.done{color:var(--text);background:var(--panel2)}
+.error{color:var(--danger);font-size:.92rem;min-height:1.2em}.notice{border-left:4px solid var(--accent);padding:10px 12px;background:var(--panel2);border-radius:8px}
+fieldset{border:1px solid var(--border);border-radius:10px;padding:12px;margin:12px 0}legend{padding:0 6px;font-weight:700}
+.hours-row{display:grid;grid-template-columns:70px 1fr 1fr 90px;gap:8px;align-items:end;margin:8px 0}.repeat{border:1px dashed var(--border);padding:10px;border-radius:10px;margin:10px 0}
+.nav{display:flex;justify-content:space-between;gap:10px;margin:16px 0;flex-wrap:wrap}pre{white-space:pre-wrap;word-break:break-word;background:#0f1c30;padding:12px;border-radius:10px;overflow:auto}
+.check{display:flex;gap:8px;align-items:center}.check input{width:auto}
+</style>
+</head>
+<body>
+<header>
+<p><a href="dashboard.html">Dashboard</a> | <a href="demo.html">Interactive demo</a></p>
+<h1>Set up your ApexVoice receptionist</h1>
+<p class="sub">Seven short steps. You can stop at any time. Your draft is saved in this browser as you type, and you can download a copy at the end.</p>
+<div id="resumeBox"></div>
+</header>
+<main>
+<nav class="progress" aria-label="Onboarding progress" id="progress"></nav>
+<p class="error" id="formError" role="alert" aria-live="polite"></p>
+
+<section class="card step" data-step="0" aria-labelledby="s1">
+<h2 id="s1">Step 1: Your business</h2>
+<label for="templateId">Start from an industry template (optional, everything stays editable)</label>
+<select id="templateId"><option value="">No template, start blank</option></select>
+<p class="sub" id="templateStatus">Loading templates if available.</p>
+<label for="businessName">Business name *</label><input id="businessName" required autocomplete="organization">
+<label for="legalName">Legal business name</label><input id="legalName">
+<div class="row"><div><label for="ownerName">Owner or main contact name</label><input id="ownerName" autocomplete="name"></div>
+<div><label for="contactPhone">Contact phone *</label><input id="contactPhone" type="tel" autocomplete="tel"></div></div>
+<div class="row"><div><label for="contactEmail">Contact email *</label><input id="contactEmail" type="email" autocomplete="email"></div>
+<div><label for="website">Website</label><input id="website" type="url" placeholder="https://"></div></div>
+<label for="address">Business address</label><input id="address" autocomplete="street-address">
+<div class="row"><div><label for="industry">Industry</label><input id="industry"></div>
+<div><label for="timezone">Timezone</label><select id="timezone"><option>America/Toronto</option><option>America/Vancouver</option><option>America/Winnipeg</option><option>America/Halifax</option><option>America/St_Johns</option><option>America/Edmonton</option></select></div></div>
+</section>
+
+<section class="card step" data-step="1" aria-labelledby="s2" hidden>
+<h2 id="s2">Step 2: Hours and holidays</h2>
+<div id="hoursWrap"></div>
+<h3>Holidays and closures</h3><div id="holidaysWrap"></div>
+<button type="button" class="btn secondary small" id="addHoliday">Add holiday or closure</button>
+</section>
+
+<section class="card step" data-step="2" aria-labelledby="s3" hidden>
+<h2 id="s3">Step 3: Your receptionist</h2>
+<label for="receptionistName">Receptionist name</label><input id="receptionistName" placeholder="For example, Alex">
+<label for="greeting">Greeting callers will hear</label><textarea id="greeting"></textarea>
+<p class="sub">Use {businessName} and it will be replaced with your business name in the demo. Be clear that this is a virtual receptionist.</p>
+</section>
+
+<section class="card step" data-step="3" aria-labelledby="s4" hidden>
+<h2 id="s4">Step 4: Services and frequently asked questions</h2>
+<h3>Services</h3><div id="servicesWrap"></div><button type="button" class="btn secondary small" id="addService">Add service</button>
+<h3>Frequently asked questions</h3><div id="faqsWrap"></div><button type="button" class="btn secondary small" id="addFaq">Add question</button>
+</section>
+
+<section class="card step" data-step="4" aria-labelledby="s5" hidden>
+<h2 id="s5">Step 5: Appointment booking</h2>
+<label class="check"><input type="checkbox" id="bookingEnabled"> Allow callers to request appointments</label>
+<div class="row"><div><label for="slotMinutes">Appointment length (minutes)</label><input id="slotMinutes" type="number" min="5" step="5" value="30"></div>
+<div><label for="leadTimeHours">Minimum lead time (hours)</label><input id="leadTimeHours" type="number" min="0" value="2"></div></div>
+<div class="row"><div><label for="bufferMinutes">Buffer between appointments (minutes)</label><input id="bufferMinutes" type="number" min="0" value="10"></div>
+<div><label class="check" style="margin-top:34px"><input type="checkbox" id="approvalRequired" checked> Business confirms before anything is booked</label></div></div>
+<label for="bookingNotes">Booking notes and instructions</label><textarea id="bookingNotes"></textarea>
+</section>
+
+<section class="card step" data-step="5" aria-labelledby="s6" hidden>
+<h2 id="s6">Step 6: Transfers, escalation and after hours</h2>
+<label class="check"><input type="checkbox" id="transferEnabled"> Allow live transfer for urgent calls</label>
+<label for="transferNumber">Transfer phone number</label><input id="transferNumber" type="tel">
+<label for="escalateKeywords">Words that should escalate a call (comma separated)</label><input id="escalateKeywords">
+<label for="urgentAction">If a call is urgent</label><select id="urgentAction"><option value="transfer">Try to transfer</option><option value="message">Take an urgent message</option><option value="emergency">Tell caller to call 911 where appropriate, then take a message</option></select>
+<label for="afterBehaviour">After-hours behaviour</label><select id="afterBehaviour"><option value="message">Take messages</option><option value="booking">Take messages and appointment requests</option><option value="emergency_only">Emergency routing only, plus messages</option></select>
+<label for="afterGreeting">After-hours greeting</label><textarea id="afterGreeting"></textarea>
+<label for="emergencyNumber">Emergency or on-call number</label><input id="emergencyNumber" type="tel">
+<h3>How messages reach you</h3>
+<label class="check"><input type="checkbox" id="emailEnabled" checked> Email messages</label>
+<label for="deliveryEmail">Message email</label><input id="deliveryEmail" type="email">
+<label class="check"><input type="checkbox" id="smsEnabled"> Text messages (SMS)</label>
+<label for="smsNumber">SMS number</label><input id="smsNumber" type="tel">
+</section>
+
+<section class="card step" data-step="6" aria-labelledby="s7" hidden>
+<h2 id="s7">Step 7: Voice, instructions and review</h2>
+<label for="voiceLabel">Voice style label</label><select id="voiceLabel"><option>Warm and professional</option><option>Friendly and upbeat</option><option>Calm and measured</option></select>
+<label for="voiceId">Voice identifier (set by Harbour and Main at activation)</label><input id="voiceId" placeholder="Leave blank until activation">
+<label for="personality">Personality</label><textarea id="personality"></textarea>
+<label for="speakingRate">Speaking pace</label><select id="speakingRate"><option value="normal">Normal</option><option value="slow">Slower</option><option value="fast">Faster</option></select>
+<label for="instructions">Business instructions and knowledge</label><textarea id="instructions" placeholder="Parking, policies, things the receptionist should never promise, and anything callers often ask. Do not enter passwords or sensitive personal information."></textarea>
+<h3>Review your configuration</h3><pre id="review" tabindex="0"></pre>
+<div class="notice"><strong>Important:</strong> Saving here stores the draft in this browser only. Connecting it to the live phone service is a backend step (POST /api/tenants/{id}/config, not yet live). Download or copy your configuration and share it with Harbour and Main for activation. No phone number is assigned by this page.</div>
+<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:14px">
+<button type="button" class="btn" id="downloadBtn">Download configuration (JSON)</button>
+<button type="button" class="btn secondary" id="copyBtn">Copy configuration</button>
+<button type="button" class="btn secondary" id="clearBtn">Clear saved draft</button>
+</div><p id="copyStatus" aria-live="polite"></p>
+</section>
+
+<div class="nav"><button type="button" class="btn secondary" id="backBtn">Back</button><button type="button" class="btn" id="nextBtn">Next</button></div>
+<p class="sub">Fields marked * are required before you finish. You can move between steps and edit anything.</p>
+</main>
+<footer><p class="sub">ApexVoice by Harbour and Main. This page does not place calls, assign phone numbers, or start billing.</p></footer>
+<script>
+const KEY='apex_business_config';let step=0;const steps=['Business','Hours','Receptionist','Services and FAQs','Booking','Transfers and after-hours','Voice and review'];let templates=[];
+const days=[['mon','Monday'],['tue','Tuesday'],['wed','Wednesday'],['thu','Thursday'],['fri','Friday'],['sat','Saturday'],['sun','Sunday']];
+function el(id){return document.getElementById(id)}
+function hoursHTML(){el('hoursWrap').innerHTML=days.map(([k,l])=>`<div class="hours-row"><span>${l}</span><div><label for="h-${k}-open">Open</label><input type="time" id="h-${k}-open" value="${k==='sat'||k==='sun'?'':'09:00'}"></div><div><label for="h-${k}-close">Close</label><input type="time" id="h-${k}-close" value="${k==='sat'||k==='sun'?'':'17:00'}"></div><label class="check"><input type="checkbox" id="h-${k}-closed" ${k==='sat'||k==='sun'?'checked':''}> Closed</label></div>`).join('')}
+function rowHTML(kind,item={}){const d=document.createElement('div');d.className='repeat';if(kind==='service'){d.innerHTML=`<label>Service name<input class="s-name" value="${esc(item.name||'')}"></label><label>Price<input class="s-price" value="${esc(item.price||'')}"></label><label>Description<textarea class="s-desc">${esc(item.description||'')}</textarea></label><button type="button" class="btn secondary small remove">Remove</button>`}else if(kind==='faq'){d.innerHTML=`<label>Question<input class="f-q" value="${esc(item.q||'')}"></label><label>Answer<textarea class="f-a">${esc(item.a||'')}</textarea></label><button type="button" class="btn secondary small remove">Remove</button>`}else{d.innerHTML=`<label>Date<input type="date" class="hol-date" value="${esc(item.date||'')}"></label><label>Label<input class="hol-label" value="${esc(item.label||'')}"></label><button type="button" class="btn secondary small remove">Remove</button>`}d.querySelector('.remove').addEventListener('click',()=>{d.remove();save()});d.addEventListener('input',save);return d}
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function collect(){const hours={};days.forEach(([k])=>{hours[k]={open:el('h-'+k+'-open').value,close:el('h-'+k+'-close').value,closed:el('h-'+k+'-closed').checked}});
+return{businessName:el('businessName').value.trim(),legalName:el('legalName').value.trim(),contact:{ownerName:el('ownerName').value.trim(),email:el('contactEmail').value.trim(),phone:el('contactPhone').value.trim(),address:el('address').value.trim(),website:el('website').value.trim()},timezone:el('timezone').value,industry:el('industry').value.trim(),hours,holidays:[...document.querySelectorAll('#holidaysWrap .repeat')].map(r=>({date:r.querySelector('.hol-date').value,label:r.querySelector('.hol-label').value.trim()})).filter(x=>x.date||x.label),receptionistName:el('receptionistName').value.trim(),greeting:el('greeting').value.trim(),services:[...document.querySelectorAll('#servicesWrap .repeat')].map(r=>({name:r.querySelector('.s-name').value.trim(),price:r.querySelector('.s-price').value.trim(),description:r.querySelector('.s-desc').value.trim()})).filter(x=>x.name||x.price||x.description),faqs:[...document.querySelectorAll('#faqsWrap .repeat')].map(r=>({q:r.querySelector('.f-q').value.trim(),a:r.querySelector('.f-a').value.trim()})).filter(x=>x.q||x.a),bookingPrefs:{enabled:el('bookingEnabled').checked,slotMinutes:+el('slotMinutes').value||30,leadTimeHours:+el('leadTimeHours').value||0,bufferMinutes:+el('bufferMinutes').value||0,approvalRequired:el('approvalRequired').checked,notes:el('bookingNotes').value.trim()},transferRules:{enabled:el('transferEnabled').checked,transferNumber:el('transferNumber').value.trim(),escalateKeywords:el('escalateKeywords').value.split(',').map(s=>s.trim()).filter(Boolean),urgentAction:el('urgentAction').value},afterHours:{behaviour:el('afterBehaviour').value,greeting:el('afterGreeting').value.trim(),emergencyNumber:el('emergencyNumber').value.trim()},messageDelivery:{email:el('deliveryEmail').value.trim(),smsNumber:el('smsNumber').value.trim(),emailEnabled:el('emailEnabled').checked,smsEnabled:el('smsEnabled').checked},voice:{voiceId:el('voiceId').value.trim(),voiceLabel:el('voiceLabel').value,personality:el('personality').value.trim(),speakingRate:el('speakingRate').value},instructions:el('instructions').value.trim(),templateId:el('templateId').value,createdAt:(window._createdAt||new Date().toISOString()),updatedAt:new Date().toISOString()}}
+function save(){try{localStorage.setItem(KEY,JSON.stringify(collect()))}catch(e){}renderReview()}
+function load(c){if(!c)return;window._createdAt=c.createdAt||new Date().toISOString();el('businessName').value=c.businessName||'';el('legalName').value=c.legalName||'';el('ownerName').value=c.contact?.ownerName||'';el('contactEmail').value=c.contact?.email||'';el('contactPhone').value=c.contact?.phone||'';el('address').value=c.contact?.address||'';el('website').value=c.contact?.website||'';el('industry').value=c.industry||'';if(c.timezone)el('timezone').value=c.timezone;if(c.hours)days.forEach(([k])=>{if(c.hours[k]){el('h-'+k+'-open').value=c.hours[k].open||'';el('h-'+k+'-close').value=c.hours[k].close||'';el('h-'+k+'-closed').checked=!!c.hours[k].closed}});(c.holidays||[]).forEach(h=>el('holidaysWrap').appendChild(rowHTML('holiday',h)));el('receptionistName').value=c.receptionistName||'';el('greeting').value=c.greeting||'';(c.services||[]).forEach(s=>el('servicesWrap').appendChild(rowHTML('service',s)));(c.faqs||[]).forEach(f=>el('faqsWrap').appendChild(rowHTML('faq',f)));if(!(c.services||[]).length)el('servicesWrap').appendChild(rowHTML('service'));if(!(c.faqs||[]).length)el('faqsWrap').appendChild(rowHTML('faq'));el('bookingEnabled').checked=!!c.bookingPrefs?.enabled;el('slotMinutes').value=c.bookingPrefs?.slotMinutes||30;el('leadTimeHours').value=c.bookingPrefs?.leadTimeHours??2;el('bufferMinutes').value=c.bookingPrefs?.bufferMinutes??10;el('approvalRequired').checked=c.bookingPrefs?.approvalRequired!==false;el('bookingNotes').value=c.bookingPrefs?.notes||'';el('transferEnabled').checked=!!c.transferRules?.enabled;el('transferNumber').value=c.transferRules?.transferNumber||'';el('escalateKeywords').value=(c.transferRules?.escalateKeywords||[]).join(', ');el('urgentAction').value=c.transferRules?.urgentAction||'transfer';el('afterBehaviour').value=c.afterHours?.behaviour||'message';el('afterGreeting').value=c.afterHours?.greeting||'';el('emergencyNumber').value=c.afterHours?.emergencyNumber||'';el('deliveryEmail').value=c.messageDelivery?.email||'';el('smsNumber').value=c.messageDelivery?.smsNumber||'';el('emailEnabled').checked=c.messageDelivery?.emailEnabled!==false;el('smsEnabled').checked=!!c.messageDelivery?.smsEnabled;el('voiceId').value=c.voice?.voiceId||'';el('voiceLabel').value=c.voice?.voiceLabel||'Warm and professional';el('personality').value=c.voice?.personality||'';el('speakingRate').value=c.voice?.speakingRate||'normal';el('instructions').value=c.instructions||'';el('templateId').value=c.templateId||'';renderReview()}
+function renderReview(){el('review').textContent=JSON.stringify(collect(),null,2)}
+function show(n){step=Math.max(0,Math.min(6,n));document.querySelectorAll('.step').forEach(s=>s.hidden=+s.dataset.step!==step);el('progress').innerHTML=steps.map((s,i)=>`<span class="step-pill ${i===step?'active':i<step?'done':''}">${i+1}. ${s}</span>`).join('');el('backBtn').disabled=step===0;el('nextBtn').textContent=step===6?'Done':'Next';if(step===6)renderReview();window.scrollTo({top:0,behavior:'smooth'})}
+function validate(finalStep){el('formError').textContent='';if(step===0||finalStep){if(!el('businessName').value.trim()){el('formError').textContent='Business name is required.';show(0);return false}if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(el('contactEmail').value.trim())){el('formError').textContent='A valid contact email is required.';show(0);return false}if(el('contactPhone').value.trim().length<7){el('formError').textContent='A contact phone number is required.';show(0);return false}}return true}
+function applyTemplate(id){const t=templates.find(x=>x.id===id);if(!t)return;el('industry').value=t.industry||'';el('receptionistName').value=t.receptionistName||'';el('greeting').value=(t.greeting||'').replace('{businessName}',el('businessName').value||'our business');el('afterGreeting').value=(t.afterHoursGreeting||'').replace('{businessName}',el('businessName').value||'our business');el('personality').value=t.personality||'';el('instructions').value=t.instructions||'';el('bookingNotes').value=t.bookingNotes||'';el('escalateKeywords').value=(t.escalateKeywords||[]).join(', ');el('urgentAction').value=t.urgentAction||'message';el('servicesWrap').innerHTML='';(t.services||[]).forEach(s=>el('servicesWrap').appendChild(rowHTML('service',s)));el('faqsWrap').innerHTML='';(t.faqs||[]).forEach(f=>el('faqsWrap').appendChild(rowHTML('faq',f)));save()}
+hoursHTML();
+el('addHoliday').addEventListener('click',()=>el('holidaysWrap').appendChild(rowHTML('holiday')));
+el('addService').addEventListener('click',()=>el('servicesWrap').appendChild(rowHTML('service')));
+el('addFaq').addEventListener('click',()=>el('faqsWrap').appendChild(rowHTML('faq')));
+el('backBtn').addEventListener('click',()=>show(step-1));
+el('nextBtn').addEventListener('click',()=>{if(step===0&&!validate(false))return;if(step===6){if(!validate(true))return;save();el('copyStatus').textContent='Configuration saved in this browser and ready to download or copy.';return}show(step+1)});
+el('downloadBtn').addEventListener('click',()=>{if(!validate(true))return;save();const blob=new Blob([JSON.stringify(collect(),null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='apexvoice-business-config.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)});
+el('copyBtn').addEventListener('click',async()=>{save();try{await navigator.clipboard.writeText(JSON.stringify(collect(),null,2));el('copyStatus').textContent='Configuration copied to clipboard.'}catch(e){el('copyStatus').textContent='Copy failed in this browser. Use Download instead.'}});
+el('clearBtn').addEventListener('click',()=>{if(confirm('Clear the saved draft in this browser?')){localStorage.removeItem(KEY);location.reload()}});
+el('templateId').addEventListener('change',e=>{applyTemplate(e.target.value);save()});
+document.addEventListener('input',save);
+let existing=null;try{existing=JSON.parse(localStorage.getItem(KEY)||'null')}catch(e){}
+if(existing&&existing.businessName){el('resumeBox').innerHTML='<div class="notice">Draft found in this browser. Your saved answers have been loaded so you can resume. Use Clear saved draft on the final step to start over.</div>';load(existing)}else{el('servicesWrap').appendChild(rowHTML('service'));el('faqsWrap').appendChild(rowHTML('faq'))}
+fetch('templates.json').then(r=>r.json()).then(d=>{templates=d.templates||[];el('templateId').innerHTML='<option value="">No template, start blank</option>'+templates.map(t=>`<option value="${esc(t.id)}">${esc(t.label)}</option>`).join('');if(existing&&existing.templateId)el('templateId').value=existing.templateId;el('templateStatus').textContent='Templates loaded. Picking one fills editable defaults.'}).catch(()=>{el('templateStatus').textContent='Templates could not be loaded from templates.json. You can still complete onboarding manually.'});
+show(0);
+</script>
+</body>
+</html>
