@@ -405,8 +405,9 @@ class Database:
         state_payload = {"call": call_record, "transcripts": []}
         # A single Redis Lua operation checks budget and acquires the slot atomically.
         # Reserve a conservative full-call allowance before allowing another call.
-        if os.getenv("VERCEL") and settings.durable_storage_backend() != "upstash_redis":
-            return False, "Upstash Redis is required for live Vercel calls", None
+        shared_state = settings.call_state_store() == "upstash_redis"
+        if is_serverless_runtime() and not shared_state:
+            return False, "Upstash Redis is required for live serverless calls", None
         if settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN:
             reserve, reserve_err = self._call_reserve_usd()
             if reserve_err:
@@ -416,9 +417,9 @@ class Database:
             state_payload = {"call": call_record, "transcripts": [], "accounting": accounting}
             marker_ttl = str(settings.MAX_CALL_DURATION_SECONDS + 60)
             acct_ttl = str(self.ACCOUNTING_TTL_SECONDS)
-            hosted = bool(os.getenv("VERCEL"))
-            # Hosted calls keep their slot until carrier confirmation. A legacy lease can
-            # be made durable on replay or by the scheduler before it expires.
+            # Every deployment without a per-request filesystem keeps its slot until
+            # the carrier confirms. A container must not fall back to an expiring lease.
+            hosted = is_serverless_runtime() or os.getenv("APEX_HOSTED", "").strip().lower() in ("1", "true", "yes")
             # KEYS: slot, spend, short marker, accounting, call state, pause, scheduler
             script = """
             if redis.call('EXISTS', KEYS[6]) == 1 then return 6 end
