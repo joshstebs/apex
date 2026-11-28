@@ -1,71 +1,40 @@
-# ApexVoice security and serverless repair status (2026-10-14)
+# ApexVoice release status (2026-11-28)
 
-## Implemented in this revision
-- Browser UI replaced with a minimal, same-origin operational dashboard. No API keys are collected or stored in browser localStorage. Administrator token stays in tab memory only.
-- Administrative APIs require a configured bearer token. CORS is not permissively enabled.
-- Production Vercel calls require Redis. Atomic Redis admission uses a Lua budget reservation and single active-call lock. A Redis outage rejects new inbound calls instead of silently falling back to SQLite.
-- Serverless call state and transcripts are read from Redis and mutated via atomic Lua operations; local SQLite is not used as the authoritative production state. Production assistant templates are version-controlled and read-only. Unsupported editing, simulations and history listing explicitly return 503 rather than pretending temporary SQLite is durable.
-- First inbound webhook uses the signed provider CallSid. The follow-up handler checks the current Redis lock owner. Duration checks use wall-clock start time rather than a fabricated 20 seconds per turn.
-- Opaque TTS URLs do not contain conversation text. Production requires shared Redis for clip metadata. Each clip can be redeemed once, reducing repeated paid ElevenLabs synthesis from URL replay. A retry after redemption will receive 410; production-grade shared MP3 caching would be preferable for carrier retries.
-- Outbound PSTN calls remain disabled.
+## What changed in this pass
 
-## Local verification
-`python test_security_regressions.py` passes using a deterministic in-memory Redis mock and FastAPI TestClient. `python -m compileall -q .` passes. No live provider calls or Vercel deployment have been tested. The older `test_final_vercel_corrections.py` is incompatible with the atomic Lua-based Redis mock and does not pass; it is retained for reference only.
+- **Container hosting.** Production behaviour was gated on the `VERCEL` variable, so the app could not run correctly anywhere else. `is_serverless_runtime()` / `is_hosted_runtime()` now distinguish an ephemeral filesystem from a long-lived container, and call-state reads and writes follow the configured store. Previously a container with Redis reserved the slot in Redis and then read an empty local SQLite, so a live call was invisible to its own webhook turns.
+- **Dockerfile and Render config** added, plus `docs/DEPLOYMENT.md` (Oracle Free Tier + Cloudflare Tunnel, Render). The image runs non-root, mounts `/data`, and has a healthcheck.
+- **Duplicate TTS charges fixed.** A failed shared-cache write discarded already-paid audio and the next retry synthesized it again. Clip IDs were random per call, so a retried webhook re-rendered the greeting into a new billable clip; they are now derived from voice + text (truncated SHA-256, still opaque).
+- **Silent-call slot retention.** Hosted slot semantics (no TTL until carrier confirmation) were `VERCEL`-only. A silent caller on a container could lose the slot mid-call and be settled against a slot it no longer owned.
+- **In-container duration watchdog.** Hosted admission refuses a call when the scheduler heartbeat is over three minutes old, and nothing on a container wrote that heartbeat. An in-process thread now refreshes it, requests carrier termination at the cap, and settles stale reservations.
+- **Staging readiness panel.** The drill returned `ok:true` while settlement was skipped for lack of Redis. It now reports `settlement_verified` and the dashboard states plainly when billing was not verified.
+- **SQLite lifecycle.** Connections are closed per transaction (PR #6), so handles no longer leak.
 
-## Critical unresolved prerequisites, do not switch the live number yet
-1. **Five-minute carrier-side hard termination:** the webhook's elapsed-time check only acts at the next speech turn. A carrier-side timer or authenticated call-update termination must be implemented and tested with SignalWire. The administrative terminate endpoint is intentionally disabled on Vercel rather than falsely claiming carrier termination.
-2. **Provider integration:** validate webhook signature using real SignalWire callbacks, confirm signed callback URL/proxy normalization, actual Hugging Face model availability, and ElevenLabs MP3 response format, latency and quotas.
-3. **Spending:** Redis reserves an estimated $3 per admitted call by default (`APEX_MAX_CALL_RESERVE_USD`, configurable) and reconciles an estimated cost. This is not a provider billing cap. ElevenLabs credits, carrier billing, inbound STT and provider costs are not reconciled against real usage. Explicit provider spending alerts/caps and a reconciliation job are needed.
-4. **Redis lifecycle:** 315-second active-call lock can expire while a call remains active; refresh/heartbeat or carrier-enforced termination is required before routing live traffic. Upstash REST EVAL support and atomic scripts need a real integration test.
-5. **Audio delivery:** single-use clip redemption blocks repeated charges but a provider retry may fail; production needs shared, encrypted/controlled cached audio bytes with a short TTL and idempotent GET behavior.
-6. **Production administration:** editing and call listing are deliberately disabled rather than relying on ephemeral storage. Implement durable indexes and authenticated mutation if those features are required.
-7. **Deployment:** no verified GitHub push, Vercel build, environment variables or publicly accessible HTTPS smoke test yet.
+## Verification performed
 
-This release is a **security and durability improvement, not production-ready live telephony**. No phone number routing was modified.
+- 27/27 offline scripts pass, including six against a real loopback `redis-server`. GitHub `offline` CI is green on `main`.
+- Local and staging smoke tests: `/`, `/api/health`, `/api/dashboard`, `/api/staging/exercise`; unauthenticated admin requests return 401; admin payloads scanned for secret-like values.
+- Proxy URL reconstruction verified for `X-Forwarded-*` behind a tunnel.
 
-## Additional update: 20-minute calls
-- Default `MAX_CALL_DURATION_SECONDS` is now 1200 (20 minutes). `.env.example` documents it and a suggested $3 call budget reservation, which must be adjusted to actual provider charges.
-- The voice prompt uses the configured duration rather than claiming five minutes.
-- The Redis active-call lease is based on the configured maximum plus 15 seconds, so it no longer expires at 315 seconds on 20-minute calls. **This is not a carrier-side cutoff or a heartbeat.**
-- Webhook-level duration enforcement only executes when SignalWire sends another gather callback. Real carrier-side termination, provider cost reconciliation, and live integrations remain outstanding.
-- Local security regression suite and compilation pass after the changes.
+## Still blocking production
 
-## 2026-10-14 additional hardening
-- Added short-lived shared Redis MP3 cache and synthesis lock for retry-safe GETs, reducing repeat ElevenLabs synthesis on carrier retries. Concurrent first requests receive HTTP 503 Retry-After instead of an unrecoverable 410. Audio remains stored in Redis as base64 and should be reviewed for size/quota/privacy suitability before production.
-- Gather callback now uses authenticated POST CallSid as source of truth and rejects a mismatched query call_id.
-- Status callback no longer truncates carrier-reported duration to the configured maximum.
-- Protected and validated cost estimator input.
-- Added test_audio_retries.py; both this test and test_security_regressions.py pass offline; compilation passes.
-- No carrier-side hard cutoff, live Redis/SignalWire/ElevenLabs/HF testing, billing reconciliation, GitHub push, or Vercel deployment has been completed. Keep live routing unchanged.
+1. **Live provider validation.** No real SignalWire call, ElevenLabs synthesis or Hugging Face completion has been executed. Signature verification, MP3 format, latency and cost are unverified against the providers.
+2. **Exact carrier cutoff.** The enforcement cycle runs every 60 seconds, so an over-duration call can exceed the cap by up to one interval. SignalWire `Update a Call` exposes only `Status=canceled|completed`; there is no duration parameter. Only a carrier-side limit gives an instant cutoff.
+3. **No deployment yet.** The Docker image was not built in this environment and no host has been provisioned. Oracle SSH rejected the available keys; Render requires an account action and a paid instance for a persistent disk.
+4. **Billing reconciliation.** Reservations and spend are application estimates, not provider invoices. There is no reconciliation job against real usage.
+5. **Retention and privacy.** Redis holds transcripts and captured messages for up to 24 hours with no operator-facing deletion control.
+6. **Human handoff and booking.** The receptionist captures a message for later review. It does not transfer calls, notify staff or book appointments; those remain unimplemented, not merely disabled.
 
-## 2026-10-22 code-review adjustments
-- Eliminated conflicting 300-second sample duration; the documented default is 1200 seconds (still NOT carrier-enforced).
-- Degraded-mode AI fallback can no longer invent booking confirmations, RMA codes, prices, or savings, and never triggers extraction tools.
-- Local SQLite no longer disables synchronous durability; Vercel no longer initializes an unnecessary instance-local database.
-- Redis `SET NX` failure for durable state creation now fails closed, and provider gather outage returns an XML hangup instead of HTTP 500.
-- Sample config includes `APEX_ADMIN_TOKEN`; added `.gitignore` for secrets/runtime state; README now accurately labels prototype and unverified features.
-- Renamed obsolete failing test suite to `legacy_vercel_corrections_reference.py` rather than presenting it as a valid regression test.
-- Added `test_safe_fallbacks.py`. Actual provider-integrated behavior remains untested.
-- Vercel deployments now force webhook signature enforcement regardless of an accidentally insecure `ENFORCE_WEBHOOK_SIGNATURE` environment override; health readouts no longer treat Turso-only storage as production-call-ready.
+## Safety state
 
+`RECEPTIONIST_ENABLED=false`. Outbound calling is disabled in code and cannot be
+enabled by configuration. Staging forces a $0 budget and the mock provider. No
+phone number routing was changed.
 
-## 2026-10-22 Harbour & Main receptionist staged implementation
-- Added a dedicated inbound Harbour & Main AI receptionist persona with explicit AI/transcription notice and safe information boundaries.
-- Default inbound assistant uses `INBOUND_ASSISTANT_ID`; public webhook query overrides are disabled by default and calls to other numbers are rejected.
-- Added an independent `RECEPTIONIST_ENABLED` safety switch, off by default.
-- Added SignalWire REST call-completion support, protected administrative terminate API, and an external scheduler watchdog endpoint that only *requests* call termination.
-- **Not an exact hard 20-minute limit.** Minute scheduling requires separate external setup, which is not bundled or enabled. Failed scheduler/carrier requests can result in calls running longer.
-- Still requires separate provider credentials, durable Redis, real test DID ownership confirmation, carrier webhook configuration, live integration tests, and actual billing reconciliation. No number was purchased or routed.
+## Change history
 
-
-## 2026-10-29 purchased-number onboarding
-- Confirmed user-provided newly purchased test number `+12267732234` and number inventory ID `8f935d8b-bd61-457b-b421-edddfef247ea`.
-- Default DID and documentation updated; assistant retains ElevenLabs Rachel/Turbo v2.5 for speech output.
-- Added `receptionist_provider_ready` non-secret health flag and fail-closed production provider readiness check.
-- Added regression fixture for exact DID, ElevenLabs speech request and cXML webhook URLs.
-- Not a completed real-number hookup: SignalWire and ElevenLabs credentials, Hugging Face model credentials and Upstash Redis environment variables, and carrier-side Voice URL routing still need to be configured and verified.
-- `RECEPTIONIST_ENABLED=false` until live provider validation. No phone route changed.
-
-- Fixed a production smoke-test finding: the obsolete `vercel.json` catch-all rewrite to `/api/index` caused FastAPI 404 at `/` and `/api/health`. Native FastAPI autodetection should handle original request paths.
-
-- Confirmed the branded production hostname `apex.harbourandmain.com` returns HTTP 200, and selected it for PUBLIC_URL and cXML callbacks rather than the temporary Vercel hostname.
+Older entries were removed because they described a Vercel-only architecture and
+listed blockers that no longer exist (lock expiry, single-use clips, Vercel
+deployment). For traceability use `git log --follow RELEASE_STATUS.md` and the
+per-commit messages on `main`; each merge records what was verified and what was
+not.

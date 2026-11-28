@@ -1,18 +1,28 @@
 # ApexVoice AI
 
-Self-hostable prototype for a SignalWire inbound voice assistant, using ElevenLabs for spoken replies, the Hugging Face chat-completions router for reasoning, Redis for shared serverless call state, and FastAPI for the web/API layer.
+Self-hostable prototype for a SignalWire inbound voice assistant, using ElevenLabs for spoken replies, the Hugging Face chat-completions router for reasoning, Redis for shared call state, and FastAPI for the web/API layer. It runs on a container (Oracle Cloud, Render, Docker) as well as on serverless hosts.
 
-**Release status: NOT PRODUCTION READY.** This version has not been verified with live SignalWire, ElevenLabs, Hugging Face, Upstash Redis or Vercel. It is not safe to route a live phone number here. Outbound PSTN calls are intentionally disabled.
+**Release status: NOT PRODUCTION READY.** No live SignalWire, ElevenLabs or Hugging Face call has been verified, and no deployment has passed a staging acceptance test. It is not safe to route a live phone number here. Outbound PSTN calls are intentionally disabled.
 
 ## Current capabilities
 
 - Signed inbound SignalWire Compatibility API webhook handlers and cXML conversation turns.
 - Version-controlled assistant templates in `prompts/`. Inbound uses one template or a fallback receptionist prompt.
-- Short-lived, opaque TTS clip IDs with Redis-backed MP3 retry caching in Vercel.
-- One-call admission lock and **estimated** Redis budget reservations. These are not independently enforced carrier limits.
-- Protected administrative read endpoints and a minimal same-origin operations dashboard.
-- Local SQLite simulator / assistant editing functionality only. These features are deliberately unavailable on Vercel, where Redis is the required shared state.
+- Short-lived, opaque TTS clip IDs with retry-safe MP3 caching. Clip IDs are derived from the words and voice, so a retried webhook reuses cached audio instead of paying for a second synthesis.
+- One-call admission lock and **estimated** budget reservations. These are not independently enforced carrier limits.
+- Protected administrative read endpoints and a minimal same-origin operations dashboard, including an on-demand staging readiness drill.
+- Local SQLite assistant editing and simulation. These stay available on a container using a mounted volume, and are disabled whenever call state is shared.
 - Degraded-mode replies do not fabricate appointment confirmations, return numbers or discounts.
+
+## Deployment targets
+
+Vercel is unavailable for this account. See `docs/DEPLOYMENT.md` for the supported
+path: a container behind Cloudflare Tunnel on Oracle Free Tier, or Render with a
+persistent disk. Cloudflare Workers is an experiment only.
+
+`/api/health` reports `durable_storage_configured`. When it is `false`, call state
+does not survive the next request and **no call will be admitted** — that is
+deliberate.
 
 ## Run locally
 
@@ -26,16 +36,21 @@ uvicorn app:app --host 127.0.0.1 --port 8080
 
 **Environment note:** This app reads process environment variables; copying `.env.example` does not automatically load `.env`. Load values through a trusted process manager or local shell. Never commit live keys. Set `APEX_ADMIN_TOKEN` to a strong secret to access administrative endpoints.
 
-For Docker: `docker build -t apexvoice-ai . && docker run --env-file .env -p 8000:8000 apexvoice-ai` (for local development only).
+For Docker: `docker build -t apexvoice-ai . && docker run --env-file .env -p 8000:8000 -v apex-data:/data apexvoice-ai` (for local development only; omit `-v` outside development).
 
 ## Offline checks
 
+Run every script, which is what CI does:
+
 ```sh
-python -m compileall -q app.py config.py database.py telephony.py voice_engine.py api
-python test_security_regressions.py
-python test_audio_retries.py
-python test_safe_fallbacks.py
+python -m compileall -q .
+for test_file in test_*.py; do python "$test_file"; done
 ```
+
+Four of them (`test_call_lifecycle`, `test_redis_lock`, `test_stale_settlement`,
+`test_staging_exercise`, plus `test_maintenance_watchdog` and
+`test_silent_call_lock`) use a loopback `redis-server` and skip with a clear
+message if `redis-server`/`redis-cli` are not installed.
 
 `legacy_vercel_corrections_reference.py` is an outdated test fixture that predates the Redis Lua state machine; it is retained only for traceability and is **not** a passing test.
 
