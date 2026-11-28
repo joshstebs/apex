@@ -1,0 +1,96 @@
+<!--
+  DRAFT, PRICING NOT YET APPROVED FOR PUBLICATION, DO NOT PUBLISH AS IS.
+  ApexVoice demo embed wrapper for harbourandmain.com/ai-receptionist.
+  This page does not contain a copy of the demo. It embeds the live Phase 2
+  demo page in an iframe. See INTEGRATION.md in this folder before integrating.
+-->
+<!doctype html>
+<html lang="en-CA">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Try the ApexVoice Demo | Harbour &amp; Main</title>
+<meta name="description" content="Try a simulated ApexVoice receptionist conversation in your browser. No real phone call is placed and no data leaves your browser.">
+<style>
+:root{--bg:#0b1423;--panel:#162238;--panel2:#1c2c47;--text:#eef4f3;--muted:#a9bcc5;--accent:#75d9c5;--border:#2b3f5c;--focus:#ffd166;--warn:#ffd166}
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:var(--bg);color:var(--text);line-height:1.55}
+a{color:var(--accent)}:focus-visible{outline:3px solid var(--focus);outline-offset:2px}
+header,main,footer{max-width:1080px;margin:0 auto;padding:16px}
+nav.top{display:flex;flex-wrap:wrap;gap:8px 18px;align-items:center;padding:10px 0}
+nav.top .brand{font-weight:800;color:var(--text);text-decoration:none;font-size:1.1rem}
+nav.top a{text-decoration:none}nav.top a:hover{text-decoration:underline}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:16px;margin:14px 0}
+.sub{color:var(--muted)}
+.banner{background:#3a2f0b;border:1px solid var(--warn);color:#fff3c4;border-radius:12px;padding:12px 14px;font-weight:700}
+.btn{display:inline-block;background:var(--accent);color:#0b1423;border:0;border-radius:10px;padding:11px 16px;font-weight:700;cursor:pointer;text-decoration:none;font:inherit}
+.btn.secondary{background:transparent;color:var(--text);border:1px solid var(--border)}
+ul.tight li{margin:.35em 0}
+.framewrap{border:1px solid var(--border);border-radius:14px;overflow:hidden;background:var(--panel)}
+iframe{display:block;width:100%;height:900px;border:0}
+@media(max-width:760px){iframe{height:1100px}}
+footer{color:var(--muted);font-size:.95rem}
+</style></head>
+<body>
+<header>
+<nav class="top" aria-label="Page">
+  <a class="brand" href="index.html">Harbour &amp; Main</a>
+  <a href="index.html#how">How it works</a>
+  <a href="index.html#pricing">Pricing</a>
+  <a href="index.html#privacy">AI and privacy</a>
+  <a href="index.html#faq">FAQ</a>
+  <a href="index.html#request-demo">Request a demo</a>
+</nav>
+<h1>Try the ApexVoice receptionist</h1>
+<div class="banner" role="note">SIMULATED: This demo runs in your browser. No real phone call is placed, nothing is booked, and no data leaves your browser.</div>
+<p>This is the same conversation a caller has with ApexVoice, presented as a simulation so you can try it without a phone call. Pick an industry template inside the demo, change the sample business name and greeting, and try the scenario buttons: book an appointment request, ask about hours or prices, leave a message, or test an emergency.</p>
+</header>
+<main>
+
+<section class="card">
+<h2>What to try</h2>
+<ul class="tight">
+<li><strong>Book an appointment.</strong> The receptionist collects a name, service, preferred time and phone number, then creates a request. In the live service the business confirms availability before anything is booked. The demo also lets you download a real calendar file for the request.</li>
+<li><strong>Leave a message.</strong> Notice the four fields it always collects: caller name, callback number, reason, and preferred contact time. Those are the fields you see in the live dashboard.</li>
+<li><strong>Ask about price or hours.</strong> Answers come only from the sample template data, and the replies say so. The live service answers only from information the business provides.</li>
+<li><strong>Say something urgent.</strong> Emergency wording gets a call 911 response, not a booking.</li>
+<li><strong>Listen.</strong> If your browser supports it, Listen buttons play a browser voice preview. The live phone service uses a different voice, and the demo labels it that way.</li>
+</ul>
+</section>
+
+<!--
+  ==========================================================================
+  DEMO PATH: SET THIS BEFORE PUBLISHING.
+  The iframe below loads the Phase 2 ApexVoice demo page. Its address is set
+  in ONE place: the APEXVOICE_DEMO_URL value in the script at the bottom of
+  this page. Change that value to the final published address of the demo
+  page (demo.html from static/commercial in the ApexVoice repo), for example
+  an absolute path on this site or the ApexVoice app origin. The fallback
+  link under the iframe is updated from the same value by the same script,
+  so there is nothing else to edit. Do not paste a copy of the demo into
+  this page.
+  ==========================================================================
+-->
+<section class="card">
+<h2>Interactive demo</h2>
+<div class="framewrap">
+<iframe id="demoFrame" title="ApexVoice simulated receptionist demo" loading="lazy"></iframe>
+</div>
+<p class="sub">If the demo does not appear above, your browser may be blocking embedded pages. <a id="demoFallback" href="demo.html">Open the ApexVoice demo in a full page instead</a>.</p>
+</section>
+
+<section class="card">
+<h2>After the demo</h2>
+<p>The demo is a simulation with sample data. A live walkthrough uses a template for your industry and your own hours, services and answers, so you hear what your callers would hear.</p>
+<p><a class="btn" href="index.html#request-demo">Request a live demo</a> <a class="btn secondary" href="index.html#pricing">See pricing</a></p>
+</section>
+
+</main>
+<footer>
+<p>ApexVoice by Harbour &amp; Main. Questions: <a href="mailto:josh@harbourandmain.com">josh@harbourandmain.com</a></p>
+</footer>
+<script>
+/* EDIT THIS ONE VALUE: the published address of the Phase 2 demo page. */
+var APEXVOICE_DEMO_URL = "demo.html";
+document.getElementById('demoFrame').src = APEXVOICE_DEMO_URL;
+document.getElementById('demoFallback').href = APEXVOICE_DEMO_URL;
+</script>
+</body></html>
