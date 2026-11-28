@@ -31,7 +31,7 @@ The Python harness uses an ASGI test client, temporary SQLite, an isolated Redis
 
 ## Verified results
 
-Baseline was `971fb58` on `main`, with Chromium fixtures from the pinned PR #7 snapshot. Local verification used Linux x86-64 and Python 3.12.14. See the PR checks for runner-specific results.
+Baseline was `971fb58` on `main`, with Chromium fixtures from the pinned PR #7 snapshot. Local verification used Linux x86-64 and Python 3.12.14. GitHub Actions also runs the suite against the PR merge candidate, which includes concurrent backend changes landed on main.
 
 | Check | Result |
 | --- | --- |
@@ -42,7 +42,7 @@ Baseline was `971fb58` on `main`, with Chromium fixtures from the pinned PR #7 s
 | Dependency scan | 15 resolved runtime packages, zero known advisories reported by PyPI. Production requirements use version ranges, so this result applies to this resolution. |
 | Bandit | Zero high severity, nine medium and six low. Medium results included URL opener scheme checks, host binding, temporary storage and SQL string construction. The gate fails on high-severity results. |
 | Redacted secret scan | Three initial generic alerts matched an empty API key next to a public voice ID and two synthetic fixtures. Scanner allowances are limited to those patterns and files. |
-| Native ARM64 | All 15 Python 3.12 runtime packages resolved as ARM64-compatible wheels. CI builds the existing image on a native ARM runner and checks non-root startup, the writable state directory, build-context exclusions and no-spend health. OCI-host performance remains unverified. |
+| Native ARM64 | All 15 Python 3.12 runtime packages resolved as ARM64-compatible wheels. The PR’s native ARM runner built the existing image and verified non-root startup, the writable state directory, build-context exclusions and no-spend health. OCI-host performance remains unverified. |
 | Production promotion | Intentionally blocks while the tracked evidence entries are open. |
 
 Benchmark run with 80 synthetic calls, 400 health requests, eight client threads and 20 ms each of injected LLM and TTS delay. These measurements include the application and ASGI client overhead. They exclude real carrier, STT, Internet and provider queueing latency.
@@ -90,6 +90,6 @@ This suite skips while the integration fixture is absent. Storage-level coverage
 
 ## CI and deployment
 
-The `ApexVoice required checks` job requires the Python, Chromium, scanner and ARM64 jobs to succeed. Configure that exact check as required on `main` after the workflow is adopted. The `ApexVoice production readiness` reusable workflow calls the same offline gates and then verifies the reviewed evidence manifest. Production deployment or promotion jobs should depend on that workflow for the exact candidate revision. Protect changes to the evidence manifest through the same review requirements as a release.
+The `ApexVoice required checks` job requires the Python, Chromium, scanner and ARM64 jobs to succeed. Configure that exact check as required on `main` after the workflow is adopted. Each push to `main` publishes `ApexVoice main promotion check`. It fails when the offline gates or the reviewed production evidence fail. The `ApexVoice production readiness` reusable workflow exposes the same checks to a release pipeline. Production deployment or promotion jobs should depend on that workflow for the exact candidate revision. Protect changes to the evidence manifest through the same review requirements as a release.
 
-The current Render blueprint has auto-deploy disabled. The existing Vercel Git integration needs its promotion rule wired to the check in project settings, and Oracle deployment needs the same gate in its release pipeline. GitHub branch protection settings returned HTTP 403 to the integration, so this branch leaves remote protection settings unmodified.
+The current Render blueprint has auto-deploy disabled. In Vercel, require `ApexVoice main promotion check` in Settings → Build and Deployment → Deployment Checks. The connected Vercel account did not expose a matching project, and the GitHub Vercel status reported the account blocked. Oracle deployment needs the same gate in its release pipeline. GitHub branch protection settings returned HTTP 403 to the integration, so this branch leaves remote protection settings unmodified.

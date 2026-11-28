@@ -148,3 +148,19 @@ jobs:
         env:
           RESULTS: ${{ toJSON(needs) }}
         run: jq -e 'to_entries | all(.value.result == "success")' <<< "$RESULTS"
+
+  production:
+    name: ApexVoice main promotion check
+    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: required
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require successful offline checks
+        env:
+          RESULT: ${{ needs.required.result }}
+        run: test "$RESULT" = success
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: python3 -m qa.production_gate
