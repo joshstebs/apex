@@ -813,6 +813,10 @@ def run_staging_exercise() -> Dict[str, Any]:
         "providers_contacted": False,
         "redis_configured": configured,
         "redis_reachable": reachable,
+        # Settlement and duplicate-charge checks only run against real Redis. Without
+        # it, the drill cannot claim the billing path works, so say so explicitly.
+        "settlement_verified": settlement not in ("skipped", "redis_unreachable")
+        and duplicate not in ("skipped", "redis_unreachable"),
         "ok": bool(
             steps_ok and signature_valid and forged_rejected and tampered_rejected
             and tool and tool.get("tool") == "save_receptionist_message"
@@ -864,7 +868,7 @@ def run_staging_exercise() -> Dict[str, Any]:
         ],
     }
     if not configured:
-        summary["notice"] = "Redis is not configured, so the drill ledger was not written."
+        summary["notice"] = "Redis is not configured, so the drill ledger was not written and settlement was not verified."
     return summary
 
 
