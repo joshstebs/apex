@@ -1,0 +1,22 @@
+name: ApexVoice production readiness
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline:
+    uses: ./.github/workflows/python-tests.yml
+  production:
+    name: ApexVoice production promotion gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: offline
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: python3 -m qa.production_gate

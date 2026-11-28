@@ -1,0 +1,9 @@
+{
+  "credential_history": {"status": "blocked"},
+  "webhook_controls": {"status": "blocked"},
+  "model_boundaries": {"status": "blocked"},
+  "emergency_handoff": {"status": "blocked"},
+  "customer_data": {"status": "blocked"},
+  "provider_readiness": {"status": "blocked"},
+  "oracle_soak": {"status": "blocked"}
+}

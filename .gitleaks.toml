@@ -1,0 +1,16 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Public default voice identifier adjacent to an empty API key"
+condition = "AND"
+paths = ['(?:^|/)\.env\.example$']
+regexTarget = "secret"
+regexes = ['^21m00Tcm4TlvDq8ikWAM$']
+
+[[allowlists]]
+description = "Synthetic provider fixtures in the archived regression reference"
+condition = "AND"
+paths = ['(?:^|/)legacy_vercel_corrections_reference\.py$']
+regexTarget = "secret"
+regexes = ['^[a-z]{2}_secret_(?:signing|elevenlabs)_key_[0-9]{6}$']
