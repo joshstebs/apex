@@ -73,6 +73,14 @@
     <ul id="stale"></ul>
   </section>
   <section>
+    <h2>Staging readiness</h2>
+    <p class="muted">Runs the receptionist path in this process with the configured provider credentials. No carrier call is placed and no paid request is made, so a passing check means the code path works, not that ElevenLabs or SignalWire accepted a real call.</p>
+    <button id="readiness" type="button">Run readiness check</button>
+    <p id="readiness-summary" class="muted">Not run yet.</p>
+    <ul id="readiness-steps"></ul>
+  </section>
+
+  <section>
     <h2>Errors</h2>
     <ul id="errors"></ul>
   </section>
@@ -100,6 +108,8 @@ function clearDashboard() {
   $("stale").replaceChildren();
   $("messages").replaceChildren();
   $("errors").replaceChildren();
+  $("readiness-steps").replaceChildren();
+  $("readiness-summary").textContent = "Not run yet.";
 }
 
 function addItem(listId, text) {
@@ -164,6 +174,49 @@ function renderDashboard(data) {
 }
 
 $("refresh").onclick = status;
+
+// The staging drill runs in-process and spends nothing, so it is safe to run
+// on demand. It reports each checked step rather than a single overall claim.
+function renderReadiness(payload) {
+  $("readiness-steps").replaceChildren();
+  const steps = payload.steps || [];
+  steps.forEach((step) => {
+    const item = document.createElement("li");
+    item.className = step.ok ? "" : "problem";
+    item.textContent = (step.ok ? "PASS " : "FAIL ") + step.name
+      + (step.settlement ? " · settlement: " + step.settlement : "")
+      + (step.spoken_text ? " · spoken: " + step.spoken_text : "");
+    $("readiness-steps").append(item);
+  });
+  const failed = steps.filter((step) => !step.ok).length;
+  const skipped = steps.filter((step) => step.settlement === "skipped").length;
+  if (payload.ok) {
+    $("readiness-summary").textContent = skipped
+      ? "All " + steps.length + " steps passed, but " + skipped + " settlement step(s) were skipped because Redis is not configured. Billing is unverified."
+      : "All " + steps.length + " steps passed. No provider was contacted.";
+  } else if (payload.steps && payload.steps.length && payload.ok === false) {
+    $("readiness-summary").textContent = failed + " of " + steps.length + " steps failed. This deployment is not ready for live calls.";
+  }
+  if (payload.notice) addItem("readiness-steps", payload.notice);
+}
+
+$("readiness").onclick = async () => {
+  $("readiness-summary").textContent = "Running…";
+  $("readiness-steps").replaceChildren();
+  try {
+    const response = await fetch("/api/staging/exercise", {
+      method: "POST",
+      headers: { Authorization: "Bearer " + adminToken },
+      cache: "no-store"
+    });
+    if (response.status === 401) throw Error("Sign in with the administrator token first.");
+    if (response.status === 404) throw Error("This deployment is not in staging mode; the drill is disabled.");
+    if (!response.ok) throw Error("Readiness check failed (HTTP " + response.status + ").");
+    renderReadiness(await response.json());
+  } catch (error) {
+    $("readiness-summary").textContent = error.message;
+  }
+};
 $("connect").onclick = async () => {
   const token = $("token").value || adminToken;
   $("token").value = "";

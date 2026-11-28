@@ -28,6 +28,8 @@ def run():
         patch.object(voice_engine, "elevenlabs_key", "test"),
         patch.object(db, "get_assistant", return_value=assistant) as get_assistant,
         patch.object(db, "get_call", return_value=call),
+        # This exercises the local-clip path, so call-state ownership checks stay out.
+        patch.object(db, "uses_shared_state", return_value=False),
         patch.object(db, "_upstash_cmd", return_value=call_id),
         patch.object(db, "try_acquire_call_slot", return_value=(True, None, "admitted")),
         patch.object(db, "add_transcript_message"),

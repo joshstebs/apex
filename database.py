@@ -10,6 +10,7 @@ import json
 import math
 import time
 import secrets
+import hashlib
 import os
 import re
 import base64
@@ -18,7 +19,7 @@ import urllib.parse
 from datetime import datetime
 from contextlib import contextmanager
 from typing import List, Dict, Any, Optional, Tuple
-from config import settings
+from config import settings, is_serverless_runtime
 
 class Database:
     # Durable accounting outlives the short marker and 24h call-state TTL.
@@ -34,6 +35,15 @@ class Database:
         self._webhook_times: List[float] = []
         if not os.getenv("VERCEL"):
             self._init_db()
+
+    def uses_shared_state(self) -> bool:
+        """True when call state must come from Redis instead of this process's SQLite.
+
+        Serverless filesystems cannot hold call state, so those runtimes always read
+        shared state. A container follows whatever store admission reserved against,
+        so a container with Redis cannot read an empty local database.
+        """
+        return is_serverless_runtime() or settings.call_state_store() == "upstash_redis"
 
     @contextmanager
     def get_connection(self):
@@ -182,7 +192,9 @@ class Database:
         Conversation text never appears in any URL.
         """
         ttl = ttl_seconds or settings.TTS_CLIP_TTL_SECONDS
-        clip_id = f"clip_{secrets.token_urlsafe(18)}"
+        # Synthesis cost is proportional to the text, so the same words reuse the
+        # same clip. A retried webhook then hits the audio cache instead of paying again.
+        clip_id = "clip_" + hashlib.sha256(f"{voice_id}\n{text}".encode("utf-8")).hexdigest()[:32]
         now = time.time()
         expires_at = now + ttl
         payload = {"text": text, "voice_id": voice_id, "expires_at": expires_at}
@@ -209,6 +221,8 @@ class Database:
         if os.getenv("VERCEL"):
             if not (settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN):
                 raise RuntimeError("Shared Redis clip storage is required")
+            return clip_id
+        if self.uses_shared_state():
             return clip_id
         # 3. Local SQLite
         with self.get_connection() as conn:
@@ -259,8 +273,8 @@ class Database:
                     except Exception:
                         pass
 
-        # Never serve instance-local clips in a serverless deployment.
-        if os.getenv("VERCEL"):
+        # Never serve instance-local clips when the clip store is shared.
+        if os.getenv("VERCEL") or self.uses_shared_state():
             return None
         # 3. Check Local SQLite
         with self.get_connection() as conn:
@@ -353,6 +367,15 @@ class Database:
             return False
         return result == "OK"
 
+    def note_paid_tts(self, clip_id: str, audio: bytes) -> None:
+        """Remember audio that was already paid for, even when the shared cache write fails.
+
+        This keeps a cache outage from charging the same clip twice on the next
+        carrier retry, without pretending the shared cache succeeded.
+        """
+        if clip_id and audio:
+            self._local_tts_audio[clip_id] = audio
+
     def read_cached_tts_audio(self, clip_id: str) -> Optional[bytes]:
         cached = self._local_tts_audio.get(clip_id)
         if cached:
@@ -382,8 +405,9 @@ class Database:
         state_payload = {"call": call_record, "transcripts": []}
         # A single Redis Lua operation checks budget and acquires the slot atomically.
         # Reserve a conservative full-call allowance before allowing another call.
-        if os.getenv("VERCEL") and settings.durable_storage_backend() != "upstash_redis":
-            return False, "Upstash Redis is required for live Vercel calls", None
+        shared_state = settings.call_state_store() == "upstash_redis"
+        if is_serverless_runtime() and not shared_state:
+            return False, "Upstash Redis is required for live serverless calls", None
         if settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN:
             reserve, reserve_err = self._call_reserve_usd()
             if reserve_err:
@@ -393,9 +417,9 @@ class Database:
             state_payload = {"call": call_record, "transcripts": [], "accounting": accounting}
             marker_ttl = str(settings.MAX_CALL_DURATION_SECONDS + 60)
             acct_ttl = str(self.ACCOUNTING_TTL_SECONDS)
-            hosted = bool(os.getenv("VERCEL"))
-            # Hosted calls keep their slot until carrier confirmation. A legacy lease can
-            # be made durable on replay or by the scheduler before it expires.
+            # Every deployment without a per-request filesystem keeps its slot until
+            # the carrier confirms. A container must not fall back to an expiring lease.
+            hosted = is_serverless_runtime() or os.getenv("APEX_HOSTED", "").strip().lower() in ("1", "true", "yes")
             # KEYS: slot, spend, short marker, accounting, call state, pause, scheduler
             script = """
             if redis.call('EXISTS', KEYS[6]) == 1 then return 6 end
@@ -487,7 +511,7 @@ class Database:
                 return False, "Call already completed; duplicate admission refused", "duplicate"
             if ok == 2:
                 # Same call, already reserved: retry must not reserve twice.
-                if os.getenv("VERCEL"):
+                if os.getenv("VERCEL") or self.uses_shared_state():
                     try:
                         self.ensure_durable_call_state(call_id, state_payload)
                     except Exception:
@@ -496,7 +520,7 @@ class Database:
             if ok == 3:
                 # Lock is ours but reservation accounting is missing. Recover only from
                 # durable state; never assume a month or amount.
-                if os.getenv("VERCEL"):
+                if os.getenv("VERCEL") or self.uses_shared_state():
                     try:
                         state = self.load_durable_call_state(call_id) or {}
                         recovered = state.get("accounting") if isinstance(state, dict) else None
@@ -515,7 +539,9 @@ class Database:
             if ok != 1:
                 return False, "Durable admission could not be verified", None
 
-        if os.getenv("VERCEL"):
+        # A Redis admission is final. Falling through to SQLite would reserve the
+        # slot twice and hide the call from every read that uses shared state.
+        if os.getenv("VERCEL") or self.uses_shared_state():
             try:
                 self.ensure_durable_call_state(call_id, state_payload)
             except Exception:
@@ -620,7 +646,7 @@ class Database:
                 if call and call.get("status") == "stale_unsettled":
                     calls.append(call)
             return calls
-        if os.getenv("VERCEL"):
+        if is_serverless_runtime():
             return []
         return [call for call in self.list_calls(50) if call.get("status") == "stale_unsettled"]
 
@@ -912,7 +938,7 @@ class Database:
             return assistant_data["id"]
 
     def get_assistant(self, assistant_id: str) -> Optional[Dict[str, Any]]:
-        if os.getenv("VERCEL"):
+        if self.uses_shared_state():
             return next((a for a in self.list_assistants() if a.get("id") == assistant_id), None)
         with self.get_connection() as conn:
             cursor = conn.cursor()
@@ -927,7 +953,7 @@ class Database:
             return None
 
     def list_assistants(self) -> List[Dict[str, Any]]:
-        if os.getenv("VERCEL"):
+        if self.uses_shared_state():
             from pathlib import Path
             return [json.loads(f.read_text()) for f in sorted((Path(__file__).parent / "prompts").glob("*.json"))]
         with self.get_connection() as conn:
@@ -965,7 +991,7 @@ class Database:
             return call_data["id"]
 
     def update_call(self, call_id: str, updates: Dict[str, Any]):
-        if os.getenv("VERCEL"):
+        if self.uses_shared_state():
             allowed = {
                 "status", "ended_at", "duration_seconds", "cost_telephony", "cost_llm",
                 "cost_tts", "cost_total", "extracted_data", "outcome_status", "settlement_source",
@@ -988,7 +1014,7 @@ class Database:
             conn.commit()
 
     def get_call(self, call_id: str) -> Optional[Dict[str, Any]]:
-        if os.getenv("VERCEL"):
+        if self.uses_shared_state():
             state = self.load_durable_call_state(call_id)
             return state.get("call") if state else None
         with self.get_connection() as conn:
@@ -1015,14 +1041,14 @@ class Database:
                 if call:
                     calls.append(call)
             return calls
-        if os.getenv("VERCEL"):
+        if is_serverless_runtime():
             raise RuntimeError("Recent call index requires Redis")
         return self.list_calls(limit)
 
     def list_receptionist_messages(self) -> List[Dict[str, Any]]:
         """Return the newest 50 captured receptionist messages from shared call state."""
         if not (settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN):
-            if os.getenv("VERCEL"):
+            if is_serverless_runtime():
                 raise RuntimeError("Shared Redis message storage is required")
             messages = []
             for call in self.list_calls(50):
@@ -1058,7 +1084,7 @@ class Database:
         return [json.loads(message) for message in messages]
 
     def list_calls(self, limit: int = 50) -> List[Dict[str, Any]]:
-        if os.getenv("VERCEL"):
+        if self.uses_shared_state():
             raise RuntimeError("Call listing requires a durable indexed store; not implemented")
         with self.get_connection() as conn:
             cursor = conn.cursor()
@@ -1077,7 +1103,7 @@ class Database:
             return results
 
     def add_transcript_message(self, call_id: str, speaker: str, message: str, latency_ms: int = 0):
-        if os.getenv("VERCEL"):
+        if self.uses_shared_state():
             self._atomic_update_state(call_id, transcript={"speaker": speaker, "message": message, "latency_ms": latency_ms, "timestamp": datetime.utcnow().isoformat()})
             return
         with self.get_connection() as conn:
@@ -1089,7 +1115,7 @@ class Database:
             conn.commit()
 
     def get_call_transcripts(self, call_id: str) -> List[Dict[str, Any]]:
-        if os.getenv("VERCEL"):
+        if self.uses_shared_state():
             state = self.load_durable_call_state(call_id)
             return state.get("transcripts", []) if state else []
         with self.get_connection() as conn:
@@ -1113,9 +1139,9 @@ class Database:
             spend_raw = self._upstash_cmd(["GET", f"apex:spend:{month_key}"])
             if spend_raw is not None:
                 return round(float(spend_raw), 4)
-        # Vercel skips local schema creation and the project disk is read-only.
+        # Serverless skips local schema creation and its disk is read-only.
         # Do not open SQLite there; the caller shows an empty spend instead of HTTP 500.
-        if os.getenv("VERCEL"):
+        if is_serverless_runtime():
             raise RuntimeError("Shared Redis is not configured")
         with self.get_connection() as conn:
             cursor = conn.cursor()

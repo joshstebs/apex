@@ -22,7 +22,7 @@ import urllib.parse
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
 
-from config import settings
+from config import settings, is_serverless_runtime
 from database import Database
 from voice_engine import VoiceEngine
 from telephony import TelephonyGateway
@@ -304,7 +304,7 @@ def handle_signalwire_inbound_or_connect(
         return blocked
     call_id = (params.get("CallSid") or "").strip()
     if not call_id:
-        if os.getenv("VERCEL"):
+        if is_serverless_runtime():
             return telephony.build_signalwire_cxml_hangup("Invalid call identifier. Goodbye.")
         call_id = f"call_{uuid.uuid4().hex[:12]}"
     from_number = params.get("From", "Unknown")
@@ -320,7 +320,7 @@ def handle_signalwire_inbound_or_connect(
             "The automated receptionist is not yet available. Please contact the business directly."
         )
     # Production calls must never proceed in an unconfigured text-only/silent demo.
-    if os.getenv("VERCEL") and not (
+    if is_serverless_runtime() and not (
         settings.CRON_SECRET and settings.get_webhook_signing_key()
         and settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN
         and settings.ELEVENLABS_API_KEY and settings.HUGGINGFACE_API_KEY
@@ -385,7 +385,7 @@ def handle_signalwire_inbound_or_connect(
 
 def end_from_gather(call_id: str, local_cost: float) -> None:
     remember_caller_message(call_id)
-    if os.getenv("VERCEL"):
+    if db.uses_shared_state():
         # Hangup cXML is an instruction to the carrier. Keep the reservation in
         # place until the signed terminal callback reports the billed duration.
         db.mark_call_ending(call_id)
@@ -415,7 +415,7 @@ def handle_signalwire_gather_turn(
     call = db.get_call(call_id) if call_id else None
     if not call:
         return telephony.build_signalwire_cxml_hangup("Thank you for calling. Goodbye!")
-    if os.getenv("VERCEL"):
+    if db.uses_shared_state():
         if db._upstash_cmd(["EXISTS", db.CALL_PAUSE_KEY]):
             return telephony.build_signalwire_cxml_hangup("This line is temporarily unavailable. Goodbye.")
         holder = db._upstash_cmd(["GET", db.ACTIVE_CALL_KEY])
@@ -525,10 +525,8 @@ def get_sanitized_health_and_settings() -> Dict[str, Any]:
         "huggingface_router_endpoint": settings.HUGGINGFACE_ROUTER_URL,
         "huggingface_llm_model": settings.HUGGINGFACE_LLM_MODEL,
         "durable_storage_backend": settings.durable_storage_backend(),
-        "durable_storage_configured": (
-            settings.durable_storage_backend() == "upstash_redis" if os.getenv("VERCEL")
-            else settings.durable_storage_backend() in ("upstash_redis", "turso_libsql")
-        ),
+        "durable_storage_configured": settings.durable_storage_usable(),
+        "serverless_runtime": is_serverless_runtime(),
         "max_concurrent_calls": settings.MAX_CONCURRENT_CALLS,
         "active_calls_count": None,
         "max_call_duration_seconds": settings.MAX_CALL_DURATION_SECONDS,
@@ -597,7 +595,7 @@ def build_operations_dashboard() -> Dict[str, Any]:
     unavailable: List[str] = []
     notices: List[str] = []
     spend = None
-    if os.getenv("VERCEL") and not redis_configured():
+    if db.uses_shared_state() and not redis_configured():
         notices.append(
             "Shared Redis is not configured. Spend, live calls, and message history stay empty "
             "until UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN are set."
@@ -815,6 +813,10 @@ def run_staging_exercise() -> Dict[str, Any]:
         "providers_contacted": False,
         "redis_configured": configured,
         "redis_reachable": reachable,
+        # Settlement and duplicate-charge checks only run against real Redis. Without
+        # it, the drill cannot claim the billing path works, so say so explicitly.
+        "settlement_verified": settlement not in ("skipped", "redis_unreachable")
+        and duplicate not in ("skipped", "redis_unreachable"),
         "ok": bool(
             steps_ok and signature_valid and forged_rejected and tampered_rejected
             and tool and tool.get("tool") == "save_receptionist_message"
@@ -866,7 +868,7 @@ def run_staging_exercise() -> Dict[str, Any]:
         ],
     }
     if not configured:
-        summary["notice"] = "Redis is not configured, so the drill ledger was not written."
+        summary["notice"] = "Redis is not configured, so the drill ledger was not written and settlement was not verified."
     return summary
 
 
@@ -939,7 +941,7 @@ try:
             credentials.credentials.encode(), token.encode()
         ):
             raise HTTPException(status_code=401, detail="Operations authentication required")
-        if not os.getenv("VERCEL") or settings.durable_storage_backend() != "upstash_redis":
+        if settings.call_state_store() != "upstash_redis":
             raise HTTPException(status_code=503, detail="Durable call control unavailable")
 
     @app.get("/api/operations", dependencies=[Depends(require_operations)])
@@ -1000,7 +1002,7 @@ try:
 
     @app.post("/api/assistants")
     def save_assistant(payload: AssistantPayload, admin=Depends(require_admin)):
-        if os.getenv("VERCEL"):
+        if db.uses_shared_state():
             raise HTTPException(status_code=503, detail="This feature is disabled until durable support is implemented")
         data = payload.model_dump()
         if not data.get("id"):
@@ -1035,7 +1037,7 @@ try:
                 detail="Outbound calling is completely disabled. Only inbound SignalWire calls and browser simulations are permitted."
             )
 
-        if os.getenv("VERCEL"):
+        if db.uses_shared_state():
             raise HTTPException(status_code=503, detail="This feature is disabled until durable support is implemented")
         ast = db.get_assistant(payload.assistant_id)
         if not ast:
@@ -1079,7 +1081,7 @@ try:
 
     @app.get("/api/calls")
     def list_calls(admin=Depends(require_admin)):
-        if os.getenv("VERCEL"):
+        if db.uses_shared_state():
             raise HTTPException(status_code=503, detail="Durable call listing is not implemented")
         return {"calls": db.list_calls()}
 
@@ -1124,7 +1126,7 @@ try:
     def terminate_call(call_id: str, admin=Depends(require_admin)):
         if settings.STAGING or settings.TELEPHONY_PROVIDER == "mock":
             raise HTTPException(status_code=403, detail="Mock telephony cannot control a live call.")
-        if os.getenv("VERCEL"):
+        if db.uses_shared_state():
             c = db.get_call(call_id)
             if not c:
                 raise HTTPException(status_code=404, detail="Call not found")
@@ -1162,7 +1164,7 @@ try:
 
     @app.post("/api/simulate/turn")
     def simulate_conversation_turn(payload: SimulationTurnPayload, admin=Depends(require_admin)):
-        if os.getenv("VERCEL"):
+        if db.uses_shared_state():
             raise HTTPException(status_code=503, detail="This feature is disabled until durable support is implemented")
         call = db.get_call(payload.call_id)
         if not call:
@@ -1225,7 +1227,7 @@ try:
         Serves ElevenLabs audio using a short-lived opaque clip_id backed by temporary storage.
         Zero conversation text is ever exposed in URLs.
         """
-        if os.getenv("VERCEL"):
+        if db.uses_shared_state():
             try:
                 if db._upstash_cmd(["EXISTS", db.CALL_PAUSE_KEY]):
                     raise HTTPException(status_code=503, detail="Call handling is paused")
@@ -1238,7 +1240,7 @@ try:
         # A short-lived synthesis lock prevents duplicate paid requests. Never persist audio locally on Vercel.
         lock_key = f"apex:tts_generating:{clip_id}"
         audio_bytes = db.read_cached_tts_audio(clip_id)
-        if audio_bytes is None and os.getenv("VERCEL"):
+        if audio_bytes is None and db.uses_shared_state():
             if db._upstash_cmd(["SET", lock_key, "1", "NX", "EX", "20"]) != "OK":
                 # Carrier can retry the same URL. Return a temporary failure, not a permanent 410.
                 raise HTTPException(status_code=503, detail="Audio generation in progress; retry shortly", headers={"Retry-After": "2"})
@@ -1249,9 +1251,10 @@ try:
                     db.note_ops_error("tts_playback_failed")
                     raise HTTPException(status_code=503, detail="ElevenLabs synthesis unavailable")
                 # A failed cache write must not hide the bytes already synthesized for this request.
-                db.cache_tts_audio(clip_id, audio_bytes)
+                if not db.cache_tts_audio(clip_id, audio_bytes):
+                    db.note_paid_tts(clip_id, audio_bytes)
             finally:
-                if os.getenv("VERCEL"):
+                if db.uses_shared_state():
                     db._upstash_cmd(["DEL", lock_key])
         return Response(
             content=audio_bytes,
@@ -1326,7 +1329,7 @@ try:
         remember_caller_message(call_id)
         try:
             call = db.get_call(call_id)
-            if not call and os.getenv("VERCEL"):
+            if not call and db.uses_shared_state():
                 if not db._upstash_cmd(["EXISTS", f"apex:acct:{call_id}"]):
                     return {"status": "ok", "tracked": False}
             outcome = apply_call_settlement(call_id, duration, "carrier", carrier_status=call_status)
@@ -1340,7 +1343,7 @@ try:
         authorization = request.headers.get("authorization", "")
         if not secret or not hmac.compare_digest(authorization.encode(), f"Bearer {secret}".encode()):
             raise HTTPException(status_code=401, detail="Unauthorized")
-        if not os.getenv("VERCEL") or settings.durable_storage_backend() != "upstash_redis":
+        if settings.call_state_store() != "upstash_redis":
             raise HTTPException(status_code=503, detail="Durable carrier enforcement unavailable")
         try:
             # Preserve any legacy leased slot before it expires while a call is active.

@@ -1,0 +1,32 @@
+{
+  "$schema": "https://render.com/schema/render.yaml.json",
+  "services": [
+    {
+      "type": "web",
+      "name": "apexvoice-staging",
+      "runtime": "docker",
+      "dockerfilePath": "./Dockerfile",
+      "plan": "starter",
+      "region": "ohio",
+      "healthCheckPath": "/api/health",
+      "autoDeploy": false,
+      "disk": {
+        "name": "apex-data",
+        "mountPath": "/data",
+        "sizeGB": 1
+      },
+      "envVars": [
+        { "key": "APEX_ENVIRONMENT", "value": "staging" },
+        { "key": "APEX_HOSTED", "value": "1" },
+        { "key": "DB_PATH", "value": "/data/voice_agents.db" },
+        { "key": "RECEPTIONIST_ENABLED", "value": "false" },
+        { "key": "OUTBOUND_NUMBER_ALLOWLIST", "value": "" },
+        { "key": "REQUIRE_MATCHING_INBOUND_NUMBER", "value": "true" },
+        { "key": "ALLOW_INBOUND_ASSISTANT_OVERRIDE", "value": "false" },
+        { "key": "INBOUND_ASSISTANT_ID", "value": "tpl_hm_receptionist" },
+        { "key": "SIGNALWIRE_PHONE_NUMBER", "value": "+12267732234" },
+        { "key": "PUBLIC_URL", "sync": false }
+      ]
+    }
+  ]
+}

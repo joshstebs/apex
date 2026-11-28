@@ -4,6 +4,21 @@ All secrets are read strictly from environment variables and never exposed via A
 """
 import os
 
+def is_serverless_runtime() -> bool:
+    """True where the filesystem is ephemeral per invocation (Vercel, Cloudflare Workers).
+
+    These runtimes must not treat local SQLite or instance memory as durable state.
+    """
+    return bool(os.getenv("VERCEL") or os.getenv("CLOUDFLARE_WORKERS"))
+
+def is_hosted_runtime() -> bool:
+    """True for any real deployment, including long-lived containers (Oracle, Render, Docker).
+
+    A container keeps its filesystem between requests, so local SQLite can be durable
+    when a persistent volume is mounted. Serverless runtimes are always hosted.
+    """
+    return is_serverless_runtime() or os.getenv("APEX_HOSTED", "").strip().lower() in ("1", "true", "yes")
+
 class AppSettings:
     def __init__(self):
         self.HOST: str = os.getenv("HOST", "0.0.0.0")
@@ -34,7 +49,7 @@ class AppSettings:
         self.RECEPTIONIST_ENABLED: bool = os.getenv("RECEPTIONIST_ENABLED", "false").lower() == "true"
         # Enforce webhook signature verification (enabled by default in production)
         # Production cannot disable provider-authenticated webhooks by mistake.
-        self.ENFORCE_WEBHOOK_SIGNATURE: bool = bool(os.getenv("VERCEL")) or os.getenv("ENFORCE_WEBHOOK_SIGNATURE", "true").lower() == "true"
+        self.ENFORCE_WEBHOOK_SIGNATURE: bool = is_hosted_runtime() or os.getenv("ENFORCE_WEBHOOK_SIGNATURE", "true").lower() == "true"
         
         # ElevenLabs Configuration
         self.ELEVENLABS_API_KEY: str = os.getenv("ELEVENLABS_API_KEY", "")
@@ -71,7 +86,7 @@ class AppSettings:
         self.TTS_CLIP_TTL_SECONDS: int = int(os.getenv("TTS_CLIP_TTL_SECONDS", "120"))  # Short-lived 120s TTL
         self.HTTP_UPSTREAM_TIMEOUT_SECONDS: float = float(os.getenv("HTTP_UPSTREAM_TIMEOUT_SECONDS", "5.5"))
 
-        environment = os.getenv("APEX_ENVIRONMENT", "production" if os.getenv("VERCEL") else "local").strip().lower()
+        environment = os.getenv("APEX_ENVIRONMENT", "production" if is_hosted_runtime() else "local").strip().lower()
         self.APEX_ENVIRONMENT: str = environment if environment in ("local", "staging", "production") else "local"
         self.STAGING: bool = self.APEX_ENVIRONMENT == "staging"
         # Staging spend is fixed in code. MONTHLY_BUDGET_LIMIT_USD cannot raise it.
@@ -91,7 +106,7 @@ class AppSettings:
         # Outbound calling is completely disabled. The allowlist cannot turn it on.
         self.OUTBOUND_CALLING_ENABLED: bool = False
         
-        default_db = "/tmp/voice_agents.db" if os.getenv("VERCEL") else "voice_agents.db"
+        default_db = "/tmp/voice_agents.db" if is_serverless_runtime() else "voice_agents.db"
         self.DB_PATH: str = os.getenv("DB_PATH", default_db)
 
     def get_webhook_signing_key(self) -> str:
@@ -110,6 +125,7 @@ class AppSettings:
             and self.TELEPHONY_PROVIDER == "signalwire"
             and self.RECEPTIONIST_ENABLED
             and self.MONTHLY_BUDGET_LIMIT_USD > 0
+            and self.durable_storage_usable()
         )
 
     def durable_storage_backend(self) -> str:
@@ -117,6 +133,27 @@ class AppSettings:
             return "upstash_redis"
         if self.TURSO_DATABASE_URL and self.TURSO_AUTH_TOKEN:
             return "turso_libsql"
+        return "local_sqlite"
+
+    def durable_storage_usable(self) -> bool:
+        """Whether call state written here survives the next request.
+
+        Serverless filesystems are per-invocation, so only a remote store counts.
+        A container keeps its filesystem, so SQLite on a mounted volume is durable.
+        """
+        backend = self.durable_storage_backend()
+        if backend in ("upstash_redis", "turso_libsql"):
+            return True
+        return not is_serverless_runtime() and is_hosted_runtime()
+
+    def call_state_store(self) -> str:
+        """The store the running process actually uses for call state.
+
+        Serverless runtimes are Redis-only. A hosted container without Redis uses
+        SQLite on its own filesystem, which is only safe on a persistent volume.
+        """
+        if self.UPSTASH_REDIS_REST_URL and self.UPSTASH_REDIS_REST_TOKEN:
+            return "upstash_redis"
         return "local_sqlite"
 
 settings = AppSettings()
