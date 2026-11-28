@@ -1,0 +1,18 @@
+# Pinned to what was actually tested on arm-free-1 (aarch64, Python 3.14.4).
+# Upper bounds follow the repo convention: >=floor,<next_major.
+
+# Realtime voice orchestration. BSD-2-Clause.
+pipecat-ai[silero,websocket]>=1.17.0,<2.0.0
+
+# Local TTS. GPL-3.0-or-later: see docs/LICENSING.md before shipping in-process.
+piper-tts>=1.8.0,<2.0.0
+
+# G.711 mu-law, removed from the stdlib in Python 3.13. PSF-2.0.
+audioop-lts>=0.2.2,<1.0.0
+
+# Numerics and transport.
+numpy>=1.26.0,<3.0.0
+websockets>=15.0,<17.0
+
+# Tests only.
+pytest>=8.0.0,<10.0.0
