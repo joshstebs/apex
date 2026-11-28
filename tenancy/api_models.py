@@ -84,7 +84,11 @@ def shape_tenant(tenant, phone_mappings=None):
     }
     if phone_mappings is not None:
         body["phoneNumbers"] = [
-            {"id": mapping.did, "phoneNumber": mapping.did, "status": mapping.status}
+            {
+                "id": "num_" + "".join(ch for ch in mapping.did if ch.isdigit()),
+                "phoneNumber": mapping.did,
+                "status": mapping.status,
+            }
             for mapping in phone_mappings
         ]
     return body
@@ -171,7 +175,33 @@ def shape_call(call):
         "appointmentId": call.appointment_id,
         "messageId": call.message_id,
         "recordingUrl": None,
+        "endedAt": getattr(call, "ended_at", None),
     }
+
+
+def shape_call_detail(call, transcripts=None, recording=None):
+    """Call detail body: the call plus its transcript turns and recording.
+
+    Transcript records are tenant records in their own right; the adapter
+    loads the ones whose call_id matches and passes them in. Recording is
+    an explicit object: when the adapter has no recording information the
+    body says so instead of implying one exists.
+    """
+    body = shape_call(call)
+    turns = []
+    for turn in transcripts or []:
+        if getattr(turn, "call_id", None) != call.id:
+            continue
+        turns.append({
+            "speaker": turn.speaker,
+            "text": turn.text,
+            "atSeconds": turn.at_seconds,
+        })
+    body["transcript"] = turns
+    body["recording"] = recording if recording is not None else {
+        "status": "unavailable", "url": None,
+    }
+    return body
 
 
 def shape_message(message):
@@ -185,6 +215,7 @@ def shape_message(message):
         "preferredTime": message.preferred_time,
         "urgent": message.urgent,
         "handled": message.handled,
+        "delivery": list(getattr(message, "delivery", None) or []),
     }
 
 
@@ -215,15 +246,18 @@ def shape_customer(customer):
 
 
 def shape_usage(summary, plan_tier, included_minutes, overage_rate_cents=35):
-    used = summary["used_minutes"]
-    overage = 0.0
+    used = int(summary["used_minutes"])
+    overage = 0
     if included_minutes is not None:
-        overage = max(0.0, used - included_minutes)
+        overage = max(0, used - int(included_minutes))
     period = summary["period"]
+    year, month = int(period[:4]), int(period[4:6])
+    end_year, end_month = (year + 1, 1) if month == 12 else (year, month + 1)
     return {
         "tenantId": summary["tenant_id"],
         "period": period,
         "periodStart": f"{period[:4]}-{period[4:6]}-01T00:00:00Z",
+        "periodEnd": f"{end_year:04d}-{end_month:02d}-01T00:00:00Z",
         "planId": plan_tier,
         "includedMinutes": included_minutes,
         "usedMinutes": used,
@@ -241,4 +275,38 @@ def shape_usage(summary, plan_tier, included_minutes, overage_rate_cents=35):
             "currency": "CAD",
             "per": "minute",
         },
+    }
+
+
+def shape_subscription(record, portal_available=False):
+    """Subscription body for GET /api/tenants/{id}/subscription.
+
+    Accepts the billing package's SubscriptionRecord, or None for a
+    tenant with no subscription, which the contract represents with
+    status "none". Billing period bounds live in Stripe until the
+    billing package stores them, so they are honest nulls here rather
+    than invented dates.
+    """
+    if record is None:
+        return {
+            "status": "none",
+            "planId": None,
+            "currentPeriodStart": None,
+            "currentPeriodEnd": None,
+            "portalAvailable": bool(portal_available),
+            "suspendRecommended": False,
+        }
+    state = getattr(record, "state", None)
+    status = getattr(state, "value", state)
+    grace = getattr(record, "grace_expires_at", None)
+    return {
+        "status": status,
+        "planId": getattr(record, "tier_id", None),
+        "stripeCustomerId": getattr(record, "stripe_customer_id", None),
+        "stripeSubscriptionId": getattr(record, "stripe_subscription_id", None),
+        "currentPeriodStart": None,
+        "currentPeriodEnd": None,
+        "graceExpiresAt": grace.isoformat() if grace is not None else None,
+        "suspendRecommended": bool(getattr(record, "suspend_recommended", False)),
+        "portalAvailable": bool(portal_available),
     }

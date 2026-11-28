@@ -1,0 +1,178 @@
+<!--
+PLATFORM OPERATOR ONLY, NOT FOR CUSTOMERS.
+Harbour and Main internal platform administration for ApexVoice.
+This page reads the platform API contract under /api/platform/ and
+shows only what that API returns. It never invents tenants, usage,
+health, or call figures: sections with no data say so. The platform
+operator token is kept in this tab's memory only. It is never saved
+to local storage and never put in the address bar.
+-->
+<!doctype html>
+<html lang="en-CA">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ApexVoice Platform Administration - Harbour and Main</title>
+<style>
+:root{--bg:#0b1423;--panel:#162238;--panel2:#1c2c47;--text:#eef4f3;--muted:#a9bcc5;--accent:#75d9c5;--border:#2b3f5c;--focus:#ffd166;--danger:#ffb4a2;--warn:#ffd166}
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:var(--bg);color:var(--text);line-height:1.5}
+a{color:var(--accent)}:focus-visible{outline:3px solid var(--focus);outline-offset:2px}
+header,main,footer{max-width:1180px;margin:0 auto;padding:16px}header{border-bottom:1px solid var(--border)}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:16px;margin:14px 0}.sub{color:var(--muted)}
+input,textarea{width:100%;padding:11px;border-radius:9px;border:1px solid var(--border);background:#0f1c30;color:var(--text);font:inherit}
+.btn{background:var(--accent);color:#0b1423;border:0;border-radius:10px;padding:11px 16px;font-weight:700;cursor:pointer}.btn.secondary{background:transparent;color:var(--text);border:1px solid var(--border)}.btn.small{padding:7px 10px}.btn.danger{background:transparent;color:var(--danger);border:1px solid var(--danger)}
+.grid{display:grid;gap:14px}@media(min-width:760px){.grid{grid-template-columns:1fr 1fr}.cards{grid-template-columns:repeat(5,1fr)}}
+.cards{display:grid;gap:14px}@media(max-width:759px){.cards{grid-template-columns:1fr 1fr}}
+.big{font-size:1.5rem;font-weight:700}
+table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:8px;border-bottom:1px solid var(--border);vertical-align:top;font-size:.95rem}
+.wrap{overflow-x:auto}
+.pill{display:inline-block;border:1px solid var(--border);border-radius:999px;padding:3px 9px;font-size:.85rem;color:var(--muted)}
+.pill.up{color:var(--accent);border-color:var(--accent)}.pill.down{color:var(--danger);border-color:var(--danger)}.pill.degraded{color:var(--warn);border-color:var(--warn)}
+.banner{border:1px solid var(--danger);color:var(--danger);border-radius:10px;padding:10px;margin:12px 0;display:none}
+.ok{color:var(--accent)}.err{color:var(--danger)}
+dialog{background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:14px;max-width:520px;width:92%}
+pre{white-space:pre-wrap;word-break:break-word}
+</style></head>
+<body>
+<header>
+<span class="pill">Platform operator</span>
+<h1>ApexVoice platform administration</h1>
+<p class="sub">Harbour and Main internal view across every ApexVoice business. Figures are estimates from recorded usage and the pricing model, not carrier or Stripe invoices. Health and live call figures appear only when the API reports them.</p>
+</header>
+<main>
+<section class="card" aria-labelledby="connectH"><h2 id="connectH">Connect</h2>
+<p class="sub">Paste a platform operator token. It stays in this tab memory only and is sent as the X-Platform-Token header. Customer tokens and the legacy shared admin token do not grant platform access.</p>
+<label for="token">Platform operator token</label><input id="token" type="password" autocomplete="off" placeholder="Paste platform operator token">
+<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px"><button type="button" class="btn" id="connectBtn">Connect</button><button type="button" class="btn secondary" id="refreshBtn">Refresh</button><button type="button" class="btn secondary" id="disconnectBtn">Disconnect and clear token</button></div>
+<p id="connectStatus" aria-live="polite"></p>
+<div class="banner" id="errorBanner" role="alert"></div>
+</section>
+
+<section aria-labelledby="overviewH"><h2 id="overviewH">Overview</h2>
+<div class="cards" id="overviewCards">
+<div class="card"><h3>Tenants</h3><p class="sub">Connect to load.</p></div>
+<div class="card"><h3>Minutes this period</h3><p class="sub">Connect to load.</p></div>
+<div class="card"><h3>Estimated cost</h3><p class="sub">Connect to load.</p></div>
+<div class="card"><h3>Revenue</h3><p class="sub">Connect to load.</p></div>
+<div class="card"><h3>Contribution</h3><p class="sub">Connect to load.</p></div>
+</div></section>
+
+<section class="card" aria-labelledby="tenantsH"><h2 id="tenantsH">Businesses</h2>
+<div class="wrap"><table><thead><tr><th>Business</th><th>Status</th><th>Plan</th><th>Subscription</th><th>Number</th><th>Usage vs limit</th><th>Est. cost</th><th>Contribution</th><th>Onboarding</th><th>Actions</th></tr></thead><tbody id="tenantRows"><tr><td colspan="10" class="sub">Connect to load the tenant list. No tenants are shown until the API returns them.</td></tr></tbody></table></div>
+</section>
+
+<div class="grid">
+<section class="card" aria-labelledby="healthH"><h2 id="healthH">Provider health</h2><div id="healthPanel"><p class="sub">Connect to load. Health comes from recorded backend probes. A provider with no probe result shows as unknown, never as healthy by default.</p></div></section>
+<section class="card" aria-labelledby="callsH"><h2 id="callsH">Failed calls and error rate</h2><div id="callsPanel"><p class="sub">Connect to load. Metrics are computed only from call records the API supplies. When the API supplies none, this panel says so instead of showing zero.</p></div></section>
+<section class="card" aria-labelledby="activeH"><h2 id="activeH">Active calls</h2><div id="activePanel"><p class="sub">Connect to load. Live call visibility depends on the backend reporting it. When it does not, the count is shown as unknown, not zero.</p></div></section>
+<section class="card" aria-labelledby="supportH"><h2 id="supportH">Support queue</h2><div id="supportPanel"><p class="sub">Support summary is part of the platform overview contract (the support field of GET /api/platform/overview). No support data source is connected yet, so no counts are shown here until the API supplies them.</p></div></section>
+</div>
+
+<section class="card" aria-labelledby="auditH"><h2 id="auditH">Audit log</h2>
+<p class="sub">Every platform action writes an audit entry with the actor, the action, the tenant, and the operator reason. Entries survive tenant deletion.</p>
+<div style="margin-bottom:10px"><button type="button" class="btn secondary small" id="auditBtn">Load audit log</button></div>
+<div class="wrap"><table><thead><tr><th>When</th><th>Actor</th><th>Action</th><th>Tenant</th><th>Reason</th></tr></thead><tbody id="auditRows"><tr><td colspan="5" class="sub">Not loaded yet.</td></tr></tbody></table></div>
+</section>
+
+<dialog id="actionDialog">
+<form method="dialog">
+<h2 id="actionTitle">Confirm action</h2>
+<p id="actionText" class="sub"></p>
+<label for="actionReason">Reason (required for suspend and delete, recorded in the audit log)</label>
+<textarea id="actionReason" rows="3" placeholder="Why is this action being taken?"></textarea>
+<p id="actionResult" aria-live="polite"></p>
+<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px">
+<button type="button" class="btn" id="actionConfirm">Run action</button>
+<button type="button" class="btn secondary" id="actionCancel">Cancel</button>
+</div>
+</form>
+</dialog>
+</main>
+<footer><p class="sub">ApexVoice platform administration by Harbour and Main. Operator surface only. Customer data shown here is limited to business metadata and aggregates; call content and customer personal details are never part of the platform overview.</p></footer>
+<script>
+let token='';
+let overview=null;
+let pendingAction=null;
+const el=id=>document.getElementById(id);
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function money(cents){if(cents===null||cents===undefined)return 'Unknown';return '$'+(cents/100).toFixed(2)+' CAD'}
+function headers(){return{'X-Platform-Token':token,'Content-Type':'application/json'}}
+function showError(msg){const b=el('errorBanner');if(msg){b.textContent=msg;b.style.display='block'}else{b.textContent='';b.style.display='none'}}
+async function api(path,opts){const r=await fetch(path,Object.assign({headers:headers()},opts||{}));let d=null;try{d=await r.json()}catch(e){}
+if(!r.ok){const m=(d&&d.error&&d.error.message)||('Request failed: '+r.status);throw new Error(m)}return d}
+
+function renderOverview(){
+const t=overview.totals;const c=t.current_period;
+const statusLine=Object.entries(t.tenants_by_status).map(([k,v])=>esc(k)+': '+v).join(', ');
+el('overviewCards').innerHTML=
+'<div class="card"><h3>Tenants</h3><p class="big">'+t.tenant_count+'</p><p class="sub">'+statusLine+'</p></div>'+
+'<div class="card"><h3>Minutes this period</h3><p class="big">'+esc(c.used_minutes)+'</p><p class="sub">Period '+esc(c.period)+', '+esc(c.call_count)+' calls</p></div>'+
+'<div class="card"><h3>Estimated cost</h3><p class="big">'+money(c.estimated_cost_cents)+'</p><p class="sub">Usage based estimate, not an invoice.</p></div>'+
+'<div class="card"><h3>Revenue</h3><p class="big">'+money(c.revenue_cents)+'</p><p class="sub">Active and past due subscriptions at list price.'+(t.tenants_without_billing_record?' '+t.tenants_without_billing_record+' tenant(s) have no billing record and are excluded.':'')+'</p></div>'+
+'<div class="card"><h3>Contribution</h3><p class="big">'+money(c.contribution_cents)+'</p><p class="sub">Revenue minus estimated cost.</p></div>';
+const rows=overview.tenants;
+el('tenantRows').innerHTML=rows.length?rows.map(r=>{
+const usage=r.spending.plan_limit_minutes===null?esc(r.usage.used_minutes)+' min, no plan limit':esc(r.usage.used_minutes)+' of '+r.spending.plan_limit_minutes+' min ('+esc(r.spending.percent_used)+' percent, '+esc(r.spending.status.replaceAll('_',' '))+')';
+const sub=r.subscription.status==='available'?esc(r.subscription.state):'unknown (no billing record)';
+const num=r.phone_numbers.length?esc(r.phone_numbers.join(', ')):'None assigned';
+const act=r.status==='suspended'?'<button type="button" class="btn small secondary" data-act="reactivate" data-tid="'+esc(r.tenant_id)+'" data-name="'+esc(r.business_name)+'">Reactivate</button>':(r.status==='deleted'?'':'<button type="button" class="btn small danger" data-act="suspend" data-tid="'+esc(r.tenant_id)+'" data-name="'+esc(r.business_name)+'">Suspend</button>');
+return '<tr><td><strong>'+esc(r.business_name)+'</strong><br><span class="sub">'+esc(r.tenant_id)+'</span></td><td>'+esc(r.status)+'</td><td>'+esc(r.plan_tier)+'</td><td>'+sub+'</td><td>'+num+'</td><td>'+usage+'</td><td>'+money(r.estimated_cost_cents)+'</td><td>'+money(r.contribution_cents)+'</td><td>'+esc(r.onboarding.status)+' ('+esc(r.onboarding.percent)+' percent)</td><td>'+act+'</td></tr>'}).join('')
+:'<tr><td colspan="10" class="sub">The API returned no tenants.</td></tr>';
+document.querySelectorAll('[data-act]').forEach(b=>b.addEventListener('click',()=>openAction(b.dataset.act,b.dataset.tid,b.dataset.name)));
+renderHealth();renderCalls();renderActive();renderSupport();
+}
+function renderHealth(){
+const h=overview.provider_health||[];
+el('healthPanel').innerHTML=h.length?h.map(p=>'<p><span class="pill '+esc(p.status)+'">'+esc(p.status)+'</span> <strong>'+esc(p.provider)+'</strong><br><span class="sub">'+(p.checked_at?'Checked '+esc(p.checked_at)+(p.source?' by '+esc(p.source):''):'No probe result recorded yet.')+'</span></p>').join(''):'<p class="sub">The API returned no provider health records.</p>';
+}
+function renderCalls(){
+const m=overview.call_metrics;
+if(!m||m.status==='no_data'){el('callsPanel').innerHTML='<p class="sub">No call records were supplied by the API for this period. Failed call counts and error rate are unknown, not zero.</p>';return}
+el('callsPanel').innerHTML='<p>Failed calls: <strong>'+m.failed+'</strong> of '+m.total+' ('+(m.error_rate===null?'rate unavailable':(m.error_rate*100).toFixed(1)+' percent')+')</p>'+(m.status==='partial'?'<p class="sub">Partial data: some tenants have no call records supplied.</p>':'');
+}
+function renderActive(){
+const a=overview.active_calls;
+if(!a||a.status!=='available'){el('activePanel').innerHTML='<p class="sub">The API is not reporting live calls right now. The active call count is unknown, not zero.</p>';return}
+el('activePanel').innerHTML='<p>Active calls now: <strong>'+a.count+'</strong></p>'+(a.calls&&a.calls.length?'<ul>'+a.calls.map(c=>'<li>'+esc(c.call_id||'call')+' - tenant '+esc(c.tenant_id||'unknown')+', started '+esc(c.started_at||'unknown')+'</li>').join('')+'</ul>':'');
+}
+function renderSupport(){
+const s=overview.support;
+if(!s||s.status!=='available'){el('supportPanel').innerHTML='<p class="sub">No support data source is connected yet. Open request counts are unknown and are not shown as zero. The summary will appear here once the API supplies support counts in the overview contract.</p>';return}
+el('supportPanel').innerHTML='<p>Open support requests: <strong>'+s.open_total+'</strong></p>';
+}
+async function loadOverview(){
+if(!token){el('connectStatus').textContent='Paste a platform operator token first.';return}
+el('connectStatus').textContent='Loading...';showError('');
+try{overview=await api('/api/platform/overview');renderOverview();el('connectStatus').innerHTML='<span class="ok">Connected.</span> Overview loaded for period '+esc(overview.period)+'.'}
+catch(e){overview=null;showError('Could not load the platform overview: '+e.message);el('connectStatus').innerHTML='<span class="err">Not connected.</span> Check the token and that the platform API is running on this origin.'}
+}
+async function loadAudit(){
+if(!token){el('connectStatus').textContent='Paste a platform operator token first.';return}
+try{const d=await api('/api/platform/audit');const entries=d.entries||[];
+el('auditRows').innerHTML=entries.length?entries.slice().reverse().map(e=>'<tr><td>'+esc(e.at||'')+'</td><td>'+esc(e.actor||'')+'</td><td>'+esc(e.action||'')+'</td><td>'+esc(e.tenant_id||'')+'</td><td>'+esc((e.details&&e.details.reason)||'')+'</td></tr>').join(''):'<tr><td colspan="5" class="sub">The audit log is empty.</td></tr>'}
+catch(e){showError('Could not load the audit log: '+e.message)}
+}
+function openAction(action,tenantId,name){
+pendingAction={action:action,tenantId:tenantId};
+el('actionTitle').textContent=(action==='suspend'?'Suspend ':'Reactivate ')+name;
+el('actionText').textContent='This calls POST /api/platform/tenants/'+tenantId+'/actions. The reason is written to the audit log.';
+el('actionReason').value='';el('actionResult').textContent='';
+el('actionDialog').showModal();
+}
+async function runAction(){
+if(!pendingAction)return;
+const reason=el('actionReason').value.trim();
+if(pendingAction.action==='suspend'&&!reason){el('actionResult').innerHTML='<span class="err">A reason is required to suspend a tenant.</span>';return}
+try{const d=await api('/api/platform/tenants/'+encodeURIComponent(pendingAction.tenantId)+'/actions',{method:'POST',body:JSON.stringify({action:pendingAction.action,reason:reason})});
+el('actionResult').innerHTML='<span class="ok">Done.</span> '+esc(d.action||pendingAction.action)+' recorded as audit entry '+esc(d.audit_id||'')+'.';
+await loadOverview();await loadAudit();
+}catch(e){el('actionResult').innerHTML='<span class="err">Action failed:</span> '+esc(e.message)}
+}
+el('connectBtn').addEventListener('click',()=>{token=el('token').value.trim();loadOverview()});
+el('refreshBtn').addEventListener('click',()=>{loadOverview();loadAudit()});
+el('disconnectBtn').addEventListener('click',()=>{token='';overview=null;el('token').value='';el('connectStatus').textContent='Disconnected. Token cleared from this tab.';showError('')});
+el('auditBtn').addEventListener('click',loadAudit);
+el('actionConfirm').addEventListener('click',runAction);
+el('actionCancel').addEventListener('click',()=>el('actionDialog').close());
+</script>
+</body>
+</html>
