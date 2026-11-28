@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en-CA">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ApexVoice Interactive Demo - Simulated</title>
+<style>
+:root{--bg:#0b1423;--panel:#162238;--panel2:#1c2c47;--text:#eef4f3;--muted:#a9bcc5;--accent:#75d9c5;--border:#2b3f5c;--focus:#ffd166;--warn:#ffd166}
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:var(--bg);color:var(--text);line-height:1.5}
+a{color:var(--accent)}:focus-visible{outline:3px solid var(--focus);outline-offset:2px}
+header,main,footer{max-width:1080px;margin:0 auto;padding:16px}
+.banner{background:#3a2f0b;border:1px solid var(--warn);color:#fff3c4;border-radius:12px;padding:12px 14px;font-weight:700}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:16px;margin:14px 0}.sub{color:var(--muted)}
+label{display:block;font-weight:600;margin:10px 0 4px}input,select,textarea{width:100%;padding:11px;border-radius:9px;border:1px solid var(--border);background:#0f1c30;color:var(--text);font:inherit}
+.btn{background:var(--accent);color:#0b1423;border:0;border-radius:10px;padding:10px 14px;font-weight:700;cursor:pointer}.btn.secondary{background:transparent;color:var(--text);border:1px solid var(--border)}.btn.small{padding:6px 10px;font-size:.9rem}
+.chips{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}.chip{background:var(--panel2);color:var(--text);border:1px solid var(--border);border-radius:999px;padding:8px 12px;cursor:pointer}
+.chat{max-height:460px;overflow:auto;border:1px solid var(--border);border-radius:12px;padding:12px;background:#0f1c30}.msg{margin:10px 0;padding:10px 12px;border-radius:12px;max-width:92%}.msg.bot{background:var(--panel2)}.msg.user{background:#23406b;margin-left:auto}.msg p{margin:.2rem 0}
+.grid{display:grid;gap:14px}@media(min-width:760px){.grid{grid-template-columns:1fr 1fr}}
+table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:8px;border-bottom:1px solid var(--border);vertical-align:top}
+.result{border:1px solid var(--accent);border-radius:12px;padding:12px;margin:10px 0}
+</style></head>
+<body>
+<header>
+<p><a href="dashboard.html">Dashboard</a> | <a href="onboarding.html">Onboarding</a></p>
+<h1>ApexVoice interactive demo</h1>
+<div class="banner" role="note">SIMULATED: Interactive simulation. No real phone call is placed and no data leaves your browser.</div>
+<p class="sub">Try the receptionist workflows with sample business data from the template you pick below. Change the name or greeting and the receptionist in this demo uses your wording.</p>
+</header>
+<main>
+<section class="card"><h2>Configure the sample business</h2>
+<label for="tpl">Industry template</label><select id="tpl"></select>
+<label for="bizName">Sample business name</label><input id="bizName" value="Harbour Plumbing and Heating">
+<label for="bizGreeting">Greeting</label><textarea id="bizGreeting"></textarea>
+<p class="sub" id="tplStatus">Loading templates.</p>
+<p class="sub">Hours used in this demo: Monday to Friday 9:00 to 17:00, closed Saturday and Sunday. Prices and answers in this demo come only from the selected template sample data and say so in the replies.</p>
+</section>
+
+<section class="card"><h2>Talk to the simulated receptionist</h2>
+<p class="sub">SIMULATED conversation. This is a rule based demo in your browser, not a live phone call and not a live AI model.</p>
+<div class="chips" aria-label="Scenario shortcuts">
+<button type="button" class="chip" data-scenario="booking">Book an appointment</button>
+<button type="button" class="chip" data-scenario="hours">Opening hours</button>
+<button type="button" class="chip" data-scenario="price">Price question</button>
+<button type="button" class="chip" data-scenario="message">Leave a message</button>
+<button type="button" class="chip" data-scenario="emergency">Emergency</button>
+</div>
+<div class="chat" id="chat" aria-live="polite" aria-label="Simulated conversation"></div>
+<label for="userInput">Your message</label>
+<div style="display:flex;gap:8px"><input id="userInput" placeholder="Type as a caller would, for example: I need a plumber tomorrow"><button type="button" class="btn" id="sendBtn">Send</button></div>
+</section>
+
+<section class="card"><h2>Dashboard preview</h2>
+<p class="sub">Preview with sample data from this demo session only. Cards created above in this demo appear here. This is not your real dashboard.</p>
+<div id="preview"><p class="sub">No booking requests or messages yet in this demo session.</p></div>
+<p><a href="dashboard.html">Open the real customer dashboard</a> (requires your admin token and shows real data only).</p>
+</section>
+
+<section class="card"><h2>What is simulated vs live</h2>
+<table><thead><tr><th>Part</th><th>In this demo</th><th>In the live service</th></tr></thead><tbody>
+<tr><td>Conversation</td><td>Simulated, rule based, runs in your browser</td><td>Phone call handled by the live ApexVoice service</td></tr>
+<tr><td>Voice preview</td><td>Browser voice preview using your device speech, if available</td><td>A different phone voice provided by the live service</td></tr>
+<tr><td>Business data</td><td>Sample template data you can edit on this page</td><td>Your saved business configuration</td></tr>
+<tr><td>Booking</td><td>Request only, plus a calendar file you can download</td><td>Business confirms availability before anything is booked</td></tr>
+<tr><td>Messages</td><td>Message card shown on this page only, nothing is sent</td><td>Delivered by email or SMS per your preferences</td></tr>
+<tr><td>Dashboard preview</td><td>Only cards from this demo session</td><td>Real calls and messages from the live API</td></tr>
+</tbody></table>
+</section>
+</main>
+<footer><p class="sub">SIMULATED demo by Harbour and Main. No testimonials or statistics are shown because this demo does not use customer data.</p></footer>
+<script>
+const el=id=>document.getElementById(id);let tpl=null;let templates=[];let flow=null;let draft={};let cards=[];
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function hasSpeech(){return 'speechSynthesis' in window}
+function bot(text){const d=document.createElement('div');d.className='msg bot';d.innerHTML=`<p><strong>${esc(tpl?tpl.receptionistName:'Receptionist')} (simulated):</strong> ${esc(text)}</p>`;if(hasSpeech()){const b=document.createElement('button');b.type='button';b.className='btn secondary small';b.textContent='Listen';b.setAttribute('aria-label','Listen to this message. Browser voice preview. The live service uses a different phone voice.');b.title='Browser voice preview. The live service uses a different phone voice.';b.addEventListener('click',()=>{try{const u=new SpeechSynthesisUtterance(text);speechSynthesis.cancel();speechSynthesis.speak(u)}catch(e){}});const note=document.createElement('p');note.className='sub';note.textContent='Browser voice preview. The live service uses a different phone voice.';d.appendChild(b);d.appendChild(note)}el('chat').appendChild(d);el('chat').scrollTop=el('chat').scrollHeight}
+function user(text){const d=document.createElement('div');d.className='msg user';d.innerHTML=`<p>${esc(text)}</p>`;el('chat').appendChild(d);el('chat').scrollTop=el('chat').scrollHeight}
+function greetingText(){return (el('bizGreeting').value||'').replaceAll('{businessName}',el('bizName').value||'our business')}
+function startFlow(kind){flow={kind,step:0};draft={};if(kind==='booking'){bot('I can take an appointment request. The business confirms availability before anything is booked. What is your name?')}else if(kind==='message'){bot('I can take a message for the business. What is your name?')}else if(kind==='emergency'){bot('If this is an emergency, please call 911 now. If you are reporting a gas smell, leave the property first, then call 911 and your gas utility. I will not book an appointment for an emergency. You can leave a non-urgent message after you are safe.')}}
+function renderPreview(){if(!cards.length){el('preview').innerHTML='<p class="sub">No booking requests or messages yet in this demo session.</p>';return}el('preview').innerHTML=cards.map(c=>c.html).join('');cards.forEach(c=>{if(c.ics){const b=el('ics-'+c.id);if(b)b.addEventListener('click',()=>downloadICS(c))}})}
+function downloadICS(c){const dt=c.when.replace(/[^0-9]/g,'').slice(0,8)||'20260101';const ics=['BEGIN:VCALENDAR','VERSION:2.0','PRODID:-//Harbour and Main//ApexVoice Demo//EN','BEGIN:VEVENT','UID:'+c.id+'@apexvoice.demo','DTSTAMP:'+dt+'T120000Z','DTSTART:'+dt+'T140000Z','DTEND:'+dt+'T143000Z','SUMMARY:'+ (c.service||'Appointment request')+' at '+(el('bizName').value||'sample business'),'DESCRIPTION:Appointment REQUEST only from the ApexVoice simulated demo. The business must confirm availability before anything is booked.','END:VEVENT','END:VCALENDAR'].join('\r\n');const blob=new Blob([ics],{type:'text/calendar'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='appointment-request.ics';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)}
+function finishBooking(){const id='b'+Date.now();const html=`<div class="result"><h3>Booking request (simulated)</h3><p><strong>Request only - in the live service the business confirms availability before anything is booked.</strong></p><p>Name: ${esc(draft.name)}<br>Service: ${esc(draft.service)}<br>Preferred time: ${esc(draft.when)}<br>Phone: ${esc(draft.phone)}</p><button type="button" class="btn small" id="ics-${id}">Download .ics file</button></div>`;cards.push({id,html,ics:true,when:draft.when,service:draft.service});const wrap=document.createElement('div');wrap.innerHTML=html;el('chat').appendChild(wrap.firstChild);const b=document.getElementById('ics-'+id);if(b)b.addEventListener('click',()=>downloadICS(cards[cards.length-1]));bot('Your request is recorded in this demo only. Nothing was booked and nothing was sent to a real business.');renderPreview();flow=null}
+function finishMessage(){const html=`<div class="result"><h3>Message taken (simulated)</h3><p>Name: ${esc(draft.name)}<br>Callback number: ${esc(draft.phone)}<br>Reason: ${esc(draft.reason)}<br>Preferred contact time: ${esc(draft.when)}</p><p class="sub">This matches the live message fields: caller_name, callback_number, reason, preferred_contact_time. In this demo nothing is sent.</p></div>`;cards.push({id:'m'+Date.now(),html});const wrap=document.createElement('div');wrap.innerHTML=html;el('chat').appendChild(wrap.firstChild);bot('Your message is shown in this demo only. Nothing was sent.');renderPreview();flow=null}
+function handle(text){user(text);const low=text.toLowerCase();
+if(/gas smell|chest pain|difficulty breathing|severe bleeding|fire|choking|unconscious/.test(low)){startFlow('emergency');return}
+if(flow){const stepsBooking=['name','service','when','phone'];const stepsMsg=['name','phone','reason','when'];const steps=flow.kind==='booking'?stepsBooking:stepsMsg;const key=steps[flow.step];draft[key]=text;flow.step++;
+if(flow.step<steps.length){const promptsBooking={service:'Which service do you need?',when:'What date and time would you prefer? For example, tomorrow at 10am.',phone:'What is the best phone number for the business to confirm on?'};const promptsMsg={phone:'What is the best callback number?',reason:'What is the message about?',when:'When is the best time to contact you?'};bot((flow.kind==='booking'?promptsBooking:promptsMsg)[steps[flow.step]]);return}
+if(flow.kind==='booking')finishBooking();else finishMessage();return}
+if(/book|appointment|schedule/.test(low)){startFlow('booking');return}
+if(/message|call back|callback/.test(low)){startFlow('message');return}
+if(/hour|open|close|when/.test(low)){bot('Based only on the sample data in this demo: Monday to Friday 9:00 to 17:00, closed Saturday and Sunday. The live business sets its own hours in onboarding.');return}
+if(/price|cost|how much|charge/.test(low)){const list=(tpl?.services||[]).map(s=>s.name+': '+(s.price||'ask for details')).join('; ');bot('Based only on the selected template sample data in this demo: '+list+'. Final pricing is confirmed by the business.');return}
+if(/emergency|urgent|flood|burst|no heat/.test(low)){bot('That sounds urgent. If anyone is in danger or this is a medical emergency, call 911 now. For the sample business in this demo, urgent keywords from the template are: '+((tpl?.escalateKeywords||[]).join(', ')||'none listed')+'. In the live service, urgent calls follow the business transfer and escalation rules. I can also take a message.');return}
+bot('I can help in this demo with booking a request, opening hours, a price question from the template sample data, leaving a message, or urgent requests. Try one of the scenario buttons above.')}
+el('sendBtn').addEventListener('click',()=>{const v=el('userInput').value.trim();if(!v)return;el('userInput').value='';handle(v)});
+el('userInput').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();el('sendBtn').click()}});
+document.querySelectorAll('[data-scenario]').forEach(b=>b.addEventListener('click',()=>{const s=b.dataset.scenario;if(s==='booking')startFlow('booking');else if(s==='message')startFlow('message');else if(s==='emergency')startFlow('emergency');else if(s==='hours')handle('What are your opening hours?');else if(s==='price')handle('How much does it cost?')}));
+el('tpl').addEventListener('change',()=>{tpl=templates.find(t=>t.id===el('tpl').value);if(!tpl)return;el('bizGreeting').value=tpl.greeting||'';el('chat').innerHTML='';bot(greetingText())});
+el('bizName').addEventListener('input',()=>{});el('bizGreeting').addEventListener('input',()=>{});
+fetch('templates.json').then(r=>r.json()).then(d=>{templates=d.templates||[];el('tpl').innerHTML=templates.map(t=>`<option value="${esc(t.id)}">${esc(t.label)}</option>`).join('');tpl=templates.find(t=>t.id==='plumbing-hvac')||templates[0];if(tpl){el('tpl').value=tpl.id;el('bizGreeting').value=tpl.greeting||''}el('tplStatus').textContent='Templates loaded. Sample data on this page comes from templates.json.';bot(greetingText())}).catch(()=>{el('tplStatus').textContent='Templates could not be loaded. The demo needs templates.json in the same folder.';bot('Hello, this is the simulated ApexVoice receptionist. Templates could not be loaded, so sample prices and services are unavailable in this session.')});
+</script>
+</body></html>
